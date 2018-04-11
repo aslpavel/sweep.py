@@ -34,6 +34,9 @@ from typing import (
 Color = Tuple[int, int, int]
 
 
+# ------------------------------------------------------------------------------
+# Coroutine
+# ------------------------------------------------------------------------------
 def coro(fn):
     """Create lite double barrel contiuation from generator
 
@@ -41,7 +44,7 @@ def coro(fn):
     """
     def coro_fn(*args, **kwargs):
         def cont_fn(on_done, on_error):
-            def coro_next(ticket, is_error, result):
+            def coro_next(ticket, is_error, result=None):
                 nonlocal gen_ticket
                 if gen_ticket != ticket:
                     warnings.warn(
@@ -75,12 +78,85 @@ def coro(fn):
     return coro_fn
 
 
-def cont(done, error=None):
-    def cont(on_done, on_error):
-        done(on_done)
-        if error is not None:
-            error(on_error)
+def thunk(fn):
+    """Decorate function, it will be executed only once
+    """
+    def fn_thunk(*args, **kwargs):
+        if not cell:
+            cell.append(fn(*args, **kwargs))
+        return cell[0]
+    cell = []
+    return fn_thunk
+
+
+def cont(in_done, in_error=None):
+    """Create continuation from (done, error) pair
+    """
+    def cont(out_done, out_error):
+        def safe_out_done(result=None):
+            return out_done(result)
+        in_done(safe_out_done)
+
+        if in_error is not None:
+            def safe_out_error(error=None):
+                if error is None:
+                    try:
+                        raise asyncio.CancelError()
+                    except Exception:
+                        out_error(sys.exc_info())
+                else:
+                    out_error(error)
+            in_error(safe_out_error)
     return cont
+
+
+def cont_run(cont, in_done=None, in_error=None):
+    nothing = lambda _: None
+    return cont(
+        nothing if in_done is None else in_done,
+        nothing if in_error is None else in_error,
+    )
+
+
+def cont_any(*conts):
+    """Create continuatino which is equal to first completed continuation
+    """
+    def cont_any(out_done, out_error):
+        @thunk
+        def callback(is_error, result=None):
+            return out_error(result) if is_error else out_done(result)
+        on_error = partial(callback, True)
+        on_done = partial(callback, False)
+
+        for cont in conts:
+            cont(on_done, on_error)
+    return cont_any
+
+
+def cont_finally(cont, callback):
+    """Add `finally` callback to continuation
+    """
+    def cont_finally(out_done, out_error):
+        def with_callback(fn, arg):
+            try:
+                return fn(arg)
+            finally:
+                callback()
+        return cont(partial(with_callback, out_done),
+                    partial(with_callback, out_error))
+    return cont_finally
+
+def cont_from_future(future):
+    """Create continuation from `Future` object
+    """
+    def cont_from_future(out_done, out_error):
+        def done_callback(future):
+            try:
+                out_done(future.result())
+            except Exception:
+                out_error(sys.exc_info())
+        future.add_done_callback(done_callback)
+    return cont_from_future
 
 
 class Event:
@@ -101,9 +177,31 @@ class Event:
             on_done(result)
 
 
-class Key(NamedTuple):
-    key: bytes
-    data: bytes
+# ------------------------------------------------------------------------------
+# TTY
+# ------------------------------------------------------------------------------
+MODE_ALT = 0b001
+MODE_CTRL = 0b010
+MODE_SHIFT = 0b100
+MODE_BITS = 3
+
+
+class Key(tuple):
+    def __new__(cls, key, mode=0, attrs=None):
+        return tuple.__new__(cls, (key, mode, attrs))
+
+    def __repr__(self):
+        key, mode, attrs = self
+        name = []
+        if mode & MODE_CTRL:
+            name.append('ctrl')
+        if mode & MODE_ALT:
+            name.append('alt')
+        name.append(key)
+        return 'Key({}{})'.format(
+            '-'.join(name),
+            '' if attrs is None else f', attrs={attrs}',
+        )
 
 
 class TTYParser:
@@ -114,14 +212,140 @@ class TTYParser:
         self._parser_coro.send(None)
 
     def __call__(self, chunk: bytes) -> Iterable[Key]:
-        return self._parser_coro.send(chunk)
+        keys = []
+        for byte in chunk:
+            key = self._parser_coro.send(byte)
+            while key is not None:
+                keys.append(key)
+                key = self._parser_coro.send(None)
+        return keys
+
 
     def _parser(self) -> Generator[Iterable[Key], bytes, None]:
-        result: Iterable[Key] = []
+        buffer = bytearray()
+        index = 0
+
+        def get():
+            if len(buffer) == index + 1:
+                buffer.append((yield))
+            index += 1
+            return buffer[index]
+
+        def back(count):
+            nonlocal index
+            index -= count
+
+        def drop():
+            nonlocal index
+            def buffer[:-index]
+            index = 0
+
         while True:
-            chunk = yield result
-            # TODO: actual parsing
-            result = [Key(chunk, chunk)]
+            if buffer:
+                for byte in buffer:
+                    yield Key('char', 0, byte)
+                del buffer[:]
+
+            buffer.append((yield))
+
+            yield from self._parse_utf8(buffer, index)
+            if not buffer:
+                pass
+
+            save = index
+            if (yield from self._parse_cpr(buffer)) is None:
+                index = save
+                continue
+
+            if 0 < buffer[-1] < 27:
+                yield Key(chr(buffer[-1] + 96), MODE_CTRL)
+                del buffer[:]
+                continue
+            elif buffer[-1] == 27:  # \x1b
+                buffer.append((yield))
+                if buffer[-1] == 91:  # [
+                    buffer.append((yield))
+                    # arrows
+                    if 64 < buffer[-1] < 69:  # {A, B, C, D}
+                        arrow = ('up', 'down', 'right', 'left')[buffer[-1] - 65]
+                        yield Key(arrow)
+                        del buffer[:]
+                        continue
+                    # alt + arrows
+                    elif buffer[-1] == 49:
+                        buffer.append((yield))
+                        if buffer[-1] == 59:  # ;
+                            buffer.append((yield))
+                            if buffer[-1] == 57:  # 9
+                                buffer.append((yield))
+                                if 64 < buffer[-1] < 69:
+                                    arrow = ('up', 'down', 'right', 'left')[buffer[-1] - 65]
+                                    yield Key(arrow, MODE_ALT)
+                                    del buffer[:]
+                                    continue
+                    else:
+                        continue
+
+    def _parse_utf8(self, buffer, index):
+        if buffer[-1] >> 5 == 0b110:  # 2 bytes UTF-8
+            ordinal = buffer[-1] & 0b11111
+            count = (1,)
+        elif buffer[-1] >> 4 == 0b1110:  # 3 bytes UTF-8
+            ordinal = buffer[-1] & 0b1111
+            count = (1, 2)
+        elif buffer[-1] >> 3 == 0b11110:  # 4 bytes UTF-8
+            ordinal = buffer[-1] & 0b111
+            count = (1, 2, 3)
+        else:
+            return
+
+        for _ in count:
+            buffer.append((yield))
+            if buffer[-1] >> 6 != 0b10:
+                return
+            ordinal = (ordinal << 6) | (buffer[-1] & 0b111111)
+
+        try:
+            char = chr(ordinal)
+        except ValueError:
+            return
+        else:
+            yield Key('utf8', attrs=chr(ordinal))
+            del buffer[:]
+
+    def _parse_number(self, get, back):
+        value = None
+        while True:
+            byte = yield from get()
+            if 47 < byte < 58:
+                if value is None:
+                    value = byte - 48
+                else:
+                    value = value * 10 - 48 + byte
+            else:
+                back(1)
+        return value
+
+    def _parse_cpr(self, get, back):
+        """Parse CPR (current position request)
+
+        format: \x1b[{line};{column}R
+        """
+        if (yield from get()) != 27:  # \x1b
+            return
+        if (yield from get()) != 91:  # [
+            return
+        line = yield from self._parse_number(get, back)
+        if line is None:
+            return
+        if (yield from get()) != 59:  # ;
+            return
+        column = yield from self._parse_number(get, back)
+        if column is None:
+            return
+        if (yield from get()) != 82:  # R
+            return
+        yield Key('cpr', attrs=(line, column))
 
 
 class TTY:
@@ -147,87 +371,126 @@ class TTY:
         self.input: asyncio.Queue[Key] = asyncio.Queue()
         self.output = open(self.fd, mode='wb', closefd=False)
 
-        async def reader() -> None:
-            parser = TTYParser()
-            while True:
-                try:
-                    chunk = os.read(self.fd, 1024)
-                    if not chunk or chunk == b'q':  # TODO: better quiting handler
-                        return None
-                except (BlockingIOError,):
-                    fut = loop.create_future()
-                    self.loop.add_reader(
-                        self.fd,
-                        lambda fut: fut.cancelled() or fut.set_result(None),
-                        fut,
-                    )
-                    await fut
-                    self.loop.remove_reader(self.fd)
-                else:
-                    keys = parser(chunk)
-                    for key in keys:
-                        await self.input.put(key)
-
-        @coro
-        def reader_coro():
-            parser = TTYParser()
-            while True:
-                try:
-                    chunk = os.read(self.fd, 1024)
-                    if not chunk or chunk == b'q':
-                        return None
-                except (BlockingIOError,):
-                    try:
-                        yield cont(partial(self.loop.add_reader, self.fd))
-                    finally:
-                        self.loop.remove_reader(self.fd)
-                else:
-                    keys = parser(chunk)
-                    for key in keys:
-                        self.input.put_nowait(key)
-
-        async def writer() -> None:
-            while True:
-                await asyncio.sleep(1)
-
-        async def closer() -> None:
-            fd = self.fd
-            os.set_blocking(self.fd, False)
-
-            attrs_old = termios.tcgetattr(fd)
-            attrs_new = termios.tcgetattr(fd)
-
-            IFLAG, LFLAG = 0, 3
-            attrs_new[IFLAG] = attrs_new[IFLAG] & ~termios.ICRNL
-            attrs_new[LFLAG] = attrs_new[LFLAG] & ~(
-                termios.ICANON |
-                termios.ECHO  # |
-                # termios.ISIG
-            )
-
-            tasks = []
-            try:
-                # set tty attributes
-                termios.tcsetattr(fd, termios.TCSADRAIN, attrs_new)
-
-                # schedule tasks
-                tasks.append(self.loop.create_task(reader()))
-                tasks.append(self.loop.create_task(writer()))
-                for task in tasks:
-                    task.add_done_callback(lambda _: self.close())
-
-                await self.closed
-            finally:
-                # stop tasks
-                for task in tasks:
-                    task.cancel()
-                # restore tty attributes
-                termios.tcsetattr(fd, termios.TCSADRAIN, attrs_old)
-                # close descriptors
-                self.output.close()
-                os.close(fd)
         self.closed = self.loop.create_future()
-        self.loop.create_task(closer())
+        cont_run(
+            self._closer(),
+            partial(print, 'closer done:'),
+            partial(print, 'closer error:'),
+        )
+
+        # self.loop.create_task(closer())
+
+    @coro
+    def _closer(self):
+        os.set_blocking(self.fd, False)
+
+        attrs_old = termios.tcgetattr(self.fd)
+        attrs_new = termios.tcgetattr(self.fd)
+        IFLAG, LFLAG = 0, 3
+        attrs_new[IFLAG] = attrs_new[IFLAG] & ~termios.ICRNL
+        attrs_new[LFLAG] = attrs_new[LFLAG] & ~(
+            termios.ICANON # |
+            # termios.ECHO |
+            # termios.ISIG
+        )
+
+        try:
+            # set tty attributes
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_new)
+
+            cont_run(cont_finally(self._reader(), self.close))
+            yield cont_from_future(self.closed)
+        finally:
+            # restore tty attributes
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
+
+            # close descriptors
+            self.output.close()
+            os.close(self.fd)
+
+    @coro
+    def _reader(self):
+        parser = TTYParser()
+        while True:
+            try:
+                chunk = os.read(self.fd, 1024)
+                if not chunk or chunk == b'q':
+                    return None
+                print(chunk)
+            except (BlockingIOError,):
+                try:
+                    yield cont_any(
+                        cont(partial(self.loop.add_reader, self.fd)),
+                        cont_from_future(self.closed),
+                    )
+                finally:
+                    self.loop.remove_reader(self.fd)
+            else:
+                keys = parser(chunk)
+                for key in keys:
+                    self.input.put_nowait(key)
+
+    # async def _reader_old() -> None:
+    #     parser = TTYParser()
+    #     while True:
+    #         try:
+    #             chunk = os.read(self.fd, 1024)
+    #             if not chunk or chunk == b'q':  # TODO: better quiting handler
+    #                 return None
+    #         except (BlockingIOError,):
+    #             fut = loop.create_future()
+    #             self.loop.add_reader(
+    #                 self.fd,
+    #                 lambda fut: fut.cancelled() or fut.set_result(None),
+    #                 fut,
+    #             )
+    #             await fut
+    #             self.loop.remove_reader(self.fd)
+    #         else:
+    #             keys = parser(chunk)
+    #             for key in keys:
+    #                 await self.input.put(key)
+
+    # async def _writer(self) -> None:
+    #     while True:
+    #         await asyncio.sleep(1)
+
+    # async def _closer(self) -> None:
+    #     fd = self.fd
+    #     os.set_blocking(self.fd, False)
+
+    #     attrs_old = termios.tcgetattr(fd)
+    #     attrs_new = termios.tcgetattr(fd)
+
+    #     IFLAG, LFLAG = 0, 3
+    #     attrs_new[IFLAG] = attrs_new[IFLAG] & ~termios.ICRNL
+    #     attrs_new[LFLAG] = attrs_new[LFLAG] & ~(
+    #         termios.ICANON |
+    #         termios.ECHO  # |
+    #         # termios.ISIG
+    #     )
+
+    #     tasks = []
+    #     try:
+    #         # set tty attributes
+    #         termios.tcsetattr(fd, termios.TCSADRAIN, attrs_new)
+
+    #         # schedule tasks
+    #         tasks.append(self.loop.create_task(self._reader()))
+    #         tasks.append(self.loop.create_task(self._writer()))
+    #         for task in tasks:
+    #             task.add_done_callback(lambda _: self.close())
+
+    #         await self.closed
+    #     finally:
+    #         # stop tasks
+    #         for task in tasks:
+    #             task.cancel()
+    #         # restore tty attributes
+    #         termios.tcsetattr(fd, termios.TCSADRAIN, attrs_old)
+    #         # close descriptors
+    #         self.output.close()
+    #         os.close(fd)
 
     def __enter__(self):
         return self
@@ -321,6 +584,9 @@ class TTY:
         else:
             self.cursor_forward(-count)
 
+    def cursor_cpr(self):
+        self.write(b'\x1b[6n')
+
     def erase_line(self) -> None:
         self.write(b'\x1b[K')
 
@@ -375,6 +641,9 @@ def main() -> None:
         async def printer():
             async for key in tty:
                 print(key)
+                if key == Key('a', MODE_CTRL):
+                    tty.cursor_cpr()
+                    tty.flush()
         task = loop.create_task(printer())
         loop.run_until_complete(tty)
         task.cancel()

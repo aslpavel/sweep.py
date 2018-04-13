@@ -48,15 +48,15 @@ class Final:
 class Parser:
     """Parser which represented as state machine
 
-    table - state transition table: List[Map[Input, State]]
-    finals - dictionary of final states: Set[State]
-    folds - is a mapping: Map[Tuple[State, State], Result? -> Input -> Result]
-    epsilons - epsilon moves: Map[State, Set[State]]
+    table    : List[Map[Input, State]]  - state transition table
+    finals   : Set[State]               - dictionary of final states
+    folds    : Map[State, Result? -> Input -> Result]
+    epsilons : Map[State, Set[State]]   - epsilon moves
     """
     STATE_START = 0
     STATE_FAIL = -1
 
-    def __init__(self, table, finals, folds=None, *, epsilons=None):
+    def __init__(self, table, finals, folds=None, epsilons=None):
         assert all(-1 <= s < len(table) for ss in table for s in ss.values()),\
             f'invalid transition state found: {table}'
         assert all(-1 <= s <= len(table) for s in finals),\
@@ -67,47 +67,71 @@ class Parser:
         self.folds = folds or {}
         self.epsilons = epsilons or {}
 
-    def compile(self, greedy=False):
+    def compile(self, callback):
         def parse(input):
             nonlocal state, value
 
-            state_new = table[state].get(input)  # consider using dense arrays?
-            if state_new is None:
-                state, value = self.STATE_FAIL, None
-                return Fail
+            if input is None:
+                state = STATE_START
+            elif state != STATE_FAIL:
+                state = table[state].get(input, STATE_FAIL)
 
-            # FIXME: handle folds
-            """
-            fold = folds.get((state, state_new))
+            if state == STATE_FAIL:
+                return (Fail, value)
+
+            fold = folds.get(state)
             if fold:
                 value = fold(value, input)
             else:
                 value = input
-            """
 
-            state = state_new
-            return Final if state in finals else Feed
-        state, value = self.STATE_START, None
+            return (Final, value) if state in finals else (Feed, value)
+
+        state, value = self.STATE_FAIL, None
 
         parser = self
         if self.epsilons:
             parser = self.optimize()
+        STATE_START, STATE_FAIL = self.STATE_START, self.STATE_FAIL
         table, finals, folds = parser.table, parser.finals, parser.folds
 
         return parse
 
+    @classmethod
+    def unit(cls, value):
+        return Parser(
+            [{}],
+            {0},
+            {0: lambda _: value},
+        )
+
     def map(self, fn):
-        return self  # FIXME: handle folds
+        def fold_closure(fold):
+            return lambda v, i: fn(fold(v, i))
+
+        parser, *_ = self._merge((self,))
+        for final in parser.finals:
+            fold = parser.folds.get(final)
+            if fold is None:
+                parser.folds[final] = lambda _, i: fn(i)
+            else:
+                parser.folds[final] = fold_closure(fold)
+        return parser
 
     @classmethod
-    def _merge(cls, parsers, table=None, finals=None, epsilons=None):
-        """Merge multiple parsers into single one
+    def _merge(cls, parsers, table=None):
+        """(Merge|Copy) multiple parsers into single one
         """
         table = table or []
-        finals = finals or set()
-        epsilons = epsilons or {}
+        finals = set()
+        epsilons = {}
+        folds = {}
+
         offsets = []
-        states_index = []
+        states_index = [None] * len(table)
+
+        def index_closure(i, m):
+            return lambda *_: print(f'{i}: {m}')
 
         for index, parser in enumerate(parsers):
             offset = len(table)
@@ -119,20 +143,28 @@ class Parser:
                 finals.add(final + offset)
             for s_in, s_outs in parser.epsilons.items():
                 epsilons[s_in + offset] = {s_out + offset for s_out in s_outs}
+            for state, fold in parser.folds.items():
+                folds[state + offset] = fold
 
-        return offsets, states_index, table, finals, epsilons
+            # FIXME:
+            for state in range(len(parser.table)):
+                if state == 0:
+                    folds[state + offset] = index_closure(index, "start")
+                if state in parser.finals:
+                    folds[state + offset] = index_closure(index, "stop")
+
+        return (
+            Parser(table, finals, folds, epsilons),
+            offsets,
+            states_index,
+        )
 
     @classmethod
     def choice(cls, parsers):
         assert len(parsers) > 0, 'parsers set must be non empyt'
-        offsets, _, table, finals, epsilons = cls._merge(parsers, table=[{}])
-        epsilons[0] = set(offsets)
-        return Parser(
-            table,
-            finals,
-            folds=None,  # FIXME: handle folds
-            epsilons=epsilons,
-        )
+        parser, offsets, _ = cls._merge(parsers, table=[{}])
+        parser.epsilons[0] = set(offsets)
+        return parser
 
     def __or__(self, other):
         return self.choice((self, other))
@@ -140,19 +172,14 @@ class Parser:
     @classmethod
     def sequence(cls, parsers):
         assert len(parsers) > 0, 'parsers set must be non empyt'
-        offsets, states_index, table, finals, epsilons = cls._merge(parsers)
-        for final in list(finals):
+        parser, offsets, states_index = cls._merge(parsers)
+        for final in list(parser.finals):
             index = states_index[final]
             if index + 1 == len(parsers):
                 continue
-            finals.discard(final)
-            epsilons.setdefault(final, set()).add(offsets[index + 1])
-        return Parser(
-            table,
-            finals,
-            folds=None,  # FIXME: handle folds
-            epsilons=epsilons,
-        )
+            parser.finals.discard(final)
+            parser.epsilons.setdefault(final, set()).add(offsets[index + 1])
+        return parser
 
     def __add__(self, other):
         return self.sequence((self, other))
@@ -165,13 +192,17 @@ class Parser:
         # TODO: correctly discard left-folds
         return (self + other).map(lambda p: p[1])
 
+    def some(self):
+        parser, *_ = self._merge((self,))
+        for final in parser.finals:
+            parser.epsilons.setdefault(final, set()).add(0)
+        return parser
+
     def many(self):
-        _, _, table, finals, epsilons = self._merge((self,))
-        for final in finals:
-            epsilons.setdefault(final, set()).add(0)
-        return Parser(table, finals, folds=None, epsilons=epsilons)
+        pass
 
     def __invert__(self):
+        # swap final and not final states?
         raise NotImplementedError()
 
     def optimize(self):
@@ -180,6 +211,8 @@ class Parser:
         # NOTE:
         #  - `n_` contains NFA states (indices in table)
         #  - `d_` constains DFA state (subset of all indices in table)
+        # TOOD:
+        #  - maybe cache epsilon-closure results, using bit-sets as identificator
         def epsilon_closure(n_states):
             """Epsilon closure (all state reachable with epsilon move) of set of states
             """
@@ -200,24 +233,37 @@ class Parser:
         d_table = {}
         d_finals = set()
 
+        # FIXME:
+        def fold_closure(folds):
+            return lambda value, input: [fold(value, input) for fold in folds]
+        d_folds = {}
+
         d_queue = [d_start]
         d_found = set()
         while d_queue:
             d_state = d_queue.pop()
-
+            # finals
             for n_state in d_state:
                 if n_state in self.finals:
                     d_finals.add(d_state)
-
+            # FIXME: folds
+            folds = []
+            for n_state in d_state:
+                fold = self.folds.get(n_state)
+                if fold is not None:
+                    folds.append(fold)
+            if folds:
+                d_folds[d_state] = fold_closure(folds)
+            # transitions
             n_trans = [self.table[n_state] for n_state in d_state]
             d_tran = {}
-            for b in {b for n_tran in n_trans for b in n_tran}:
+            for i in {i for n_tran in n_trans for i in n_tran}:
                 d_state_new = epsilon_closure(
-                    {n_tran[b] for n_tran in n_trans if b in n_tran})
+                    {n_tran[i] for n_tran in n_trans if i in n_tran})
                 if d_state_new not in d_found:
                     d_found.add(d_state_new)
                     d_queue.append(d_state_new)
-                d_tran[b] = d_state_new
+                d_tran[i] = d_state_new
             d_table[d_state] = d_tran
 
         # normalize (use indicies instead of sets to identify states)
@@ -226,18 +272,29 @@ class Parser:
             d_ss_sn.setdefault(d_state, len(d_ss_sn))
         d_sn_ss = {v: k for k, v in d_ss_sn.items()}  # state-norm -> state-set
         d_table_norm = [
-            {b: d_ss_sn[ss] for b, ss in d_table[d_sn_ss[sn]].items()}
+            {i: d_ss_sn[ss] for i, ss in d_table[d_sn_ss[sn]].items()}
             for sn in d_sn_ss
         ]
         d_finals_norm = {d_ss_sn[ss] for ss in d_finals}
 
+        # FIXME
+        d_folds_norm = {d_ss_sn[ss]: fold for ss, fold in d_folds.items()}
+
         return Parser(
             d_table_norm,
             d_finals_norm,
-            folds=None,  # FIXME: handle folds
+            d_folds_norm,
         )
 
     # DEBUG
+    def debug(self, input):
+        input = input if isinstance(input, bytes) else input.encode()
+        parse = self.compile()
+
+        print(parse(None))
+        for i in input:
+            print(parse(i))
+
     def show(self, render=True, size=384):
         import os
         import sys
@@ -247,10 +304,12 @@ class Parser:
         dot.graph_attr['rankdir'] = 'LR'
 
         for state in range(len(self.table)):
+            attrs = {'shape': 'circle'}
             if state in self.finals:
-                dot.node(str(state), shape='doublecircle')
-            else:
-                dot.node(str(state), shape='circle')
+                attrs['shape'] = 'doublecircle'
+            if state in self.folds:
+                attrs['color'] = 'blue'
+            dot.node(str(state), **attrs)
 
         edges = {}
         for state, row in enumerate(self.table):
@@ -310,12 +369,12 @@ def utf8():
 
 @apply
 def digit():
-    return match_pred(lambda b: ord('0') <= b <= ord('9'))
+    return match_pred(lambda b: ord('0') <= b <= ord('9')).map(lambda b: b - 48)
 
 
 @apply
 def number():
-    return digit + digit.many()
+    return digit.some()
 
 
 def match(bs):
@@ -341,13 +400,16 @@ def debug(fn):
 
 @debug
 def main():
-    print("parser: match(b'abc') | match(b'abd')")
-    p = match(b'abc') | match(b'abd')
+    print("parser: (match(b'abc') | match(b'abd')) + match(b'f')")
+    p = (match(b'abc') | match(b'abd')) + match(b'f')
     p.show()
     print("optimized:")
     po = p.optimize()
     po.show()
 
+    digit.map(lambda v: v + 1).debug('1')
+
 
 if __name__ == '__main__':
-    main()
+    # main()
+    pass

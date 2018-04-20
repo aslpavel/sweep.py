@@ -14,6 +14,7 @@ import asyncio
 import fcntl
 import io
 import itertools as it
+import operator as op
 import os
 import re
 import signal
@@ -21,8 +22,9 @@ import string
 import sys
 import termios
 import traceback
+import tty
 import warnings
-from functools import partial
+from functools import (partial, reduce)
 
 from typing import (
     Generator,
@@ -259,8 +261,6 @@ class Pattern:
         )
 
     def show(self, render=True, size=384):
-        import os
-        import sys
         from graphviz import Digraph
 
         dot = Digraph(format='png')
@@ -361,7 +361,7 @@ def coro(fn):
                 gen_ticket += 1
 
                 try:
-                    cont = gen.throw(result) if is_error else gen.send(result)
+                    cont = gen.throw(*result) if is_error else gen.send(result)
                 except StopIteration as ret:
                     gen.close()
                     return on_done(ret.args[0] if ret.args else None)
@@ -611,18 +611,24 @@ class TTYParser:
 
     def __call__(self, chunk: bytes) -> Iterable[TTYEvent]:
         keys = []
-        for byte in chunk:
-            alive, results, unconsumed = self._parse(byte)
-            if not alive:
-                if results:
-                    keys.append(results[-1])
-                    self._parse(None)
-                    for byte in unconsumed:
-                        self._parse(byte)
-                else:
-                    sys.stderr.write(
-                        f'[ERROR] failed to process: {bytes(unconsumed)}\n')
-                    self._parse(None)
+        while True:
+            for index, byte in enumerate(chunk):
+                alive, results, unconsumed = self._parse(byte)
+                if not alive:
+                    if results:
+                        keys.append(results[-1])
+                        self._parse(None)
+                        # reschedule unconsumed for parsing
+                        unconsumed.extend(chunk[index + 1:])
+                        chunk = unconsumed
+                        break
+                    else:
+                        sys.stderr.write(
+                            f'[ERROR] failed to process: {bytes(unconsumed)}\n')
+                        self._parse(None)
+            else:
+                # all consumed (no break in for loop)
+                break
         return keys
 
 
@@ -646,7 +652,7 @@ class TTY:
             if type != TTY_CPR:
                 self.events_queue.put_nowait(event)
             return True  # keep subscribed
-        self.events_queue: asyncio.Queue[TTYEvent] = asyncio.Queue()
+        self.events_queue = asyncio.Queue()
         self.events.on(events_queue_handler)
 
         self.closed = self.loop.create_future()
@@ -658,10 +664,21 @@ class TTY:
 
         attrs_old = termios.tcgetattr(self.fd)
         attrs_new = termios.tcgetattr(self.fd)
-        IFLAG, LFLAG = 0, 3
-        attrs_new[IFLAG] = attrs_new[IFLAG] & ~termios.ICRNL
-        attrs_new[LFLAG] = attrs_new[LFLAG] & ~(
-            termios.ICANON | termios.ECHO)  # | termios.ISIG)
+        attrs_new[tty.IFLAG] &= ~reduce(op.or_, (
+            # disable flow control ctlr-{s,q}
+            termios.IXON,
+            termios.IXOFF,
+            # carriage return
+            termios.ICRNL,
+            termios.INLCR,
+            termios.IGNCR,
+        ))
+        attrs_new[tty.LFLAG] &= ~reduce(op.or_, (
+            termios.ECHO,
+            termios.ICANON,
+            termios.IEXTEN,
+            # termios.ISIG,
+        ))
 
         try:
             # set tty attributes
@@ -688,15 +705,13 @@ class TTY:
             # wait closed event
             yield cont_from_future(self.closed)
         finally:
+            self.output.flush()
             # remove resize handler
             self.loop.remove_signal_handler(signal.SIGWINCH)
-
             # restore tty attributes
             termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
-
             # terminate queue
             self.events_queue.put_nowait(TTYEvent(TTY_CLOSE, None))
-
             # stop reader
             self.loop.remove_reader(self.fd)
             os.close(self.fd)
@@ -750,6 +765,9 @@ class TTY:
     def fileno(self) -> int:
         return self.fd
 
+    def cursor_to(self, row=0, column=0):
+        self.write(f'\x1b[{row};{column}H'.encode())
+
     def cursor_up(self, count: int) -> None:
         if count == 0:
             pass
@@ -774,7 +792,7 @@ class TTY:
         if index == 0:
             self.write(b'\x1b[G')
         elif index > 1:
-            self.write(f'\x1b[{index}'.encode())
+            self.write(f'\x1b[{index}G'.encode())
         else:
             raise ValueError(f'column index can not be negative: {index}')
 
@@ -814,8 +832,17 @@ class TTY:
 
         return await cpr
 
+    def cursor_hide(self):
+        self.write(b'\x1b[?25l')
+
+    def cursor_show(self):
+        self.write(b'\x1b[?12l\x1b[?25h')
+
     def erase_line(self) -> None:
         self.write(b'\x1b[K')
+
+    def erase_down(self):
+        self.write(b'\x1b[J')
 
     def format(self, text):
         """Write formatted text
@@ -1066,24 +1093,67 @@ class Text(tuple):
 # ------------------------------------------------------------------------------
 # Selector
 # ------------------------------------------------------------------------------
+class Input:
+    def __init__(self, prompt=None, buffer=None, cursor=None):
+        self.prompt = prompt or ''
+        self.buffer = [] if buffer is None else list(buffer)
+        self.cursor = len(self.buffer) if cursor is None else cursor
+
+    def __call__(self, event):
+        type, attrs = event
+        if type == TTY_KEY:
+            name, mode = attrs
+            if name == 'left':
+                self.cursor = max(0, self.cursor - 1)
+            elif name == 'right':
+                self.cursor = min(len(self.buffer), self.cursor + 1)
+            elif mode & KEY_MODE_CTRL:
+                if name == 'a':
+                    self.cursor = 0
+                elif name == 'e':
+                    self.cursor = len(self.buffer)
+                elif name == 'h':  # delete
+                    if self.cursor > 0:
+                        self.cursor -= 1
+                        del self.buffer[self.cursor]
+                elif name == 'k':
+                    del self.buffer[self.cursor:]
+        elif type == TTY_CHAR:
+            self.buffer.insert(self.cursor, attrs)
+            self.cursor += 1
+
+    def render(self, tty):
+        tty.write(self.prompt.encode())
+        tty.write(''.join(self.buffer).encode())
+        tty.erase_line()
+        tty.cursor_backward(len(self.buffer) - self.cursor)
+
+
 async def selector(items, *, loop=None):
     face = Face(fg=Color('#ff8040'), attrs=FACE_BOLD)
     header = Text('Press <ctrl-d> to exit\n').mark(6, 14, face)
+    ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
+    input = Input('Input: ')
 
     with TTY(loop=loop) as tty:
         # header
         tty.write(bytes(header))
 
-        # show cursor postion
-        position = await tty.cursor_cpr()
-        tty.write(f'Postion: {position}\n'.encode())
-        tty.flush()
-
-        # show events
-        ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
+        tty.write(b'\n\n')
+        tty.cursor_up(2)
+        line, column = await tty.cursor_cpr()
         async for event in tty:
-            print(event)
+            tty.cursor_to(line, column)
+            tty.write(f'[{event}]'.encode())
+            tty.erase_line()
+
+            tty.cursor_to(line + 1, column)
+            input(event)
+            input.render(tty)
+
+            tty.flush()
             if event == ctrl_d:
+                tty.cursor_to(line + 2, column)
                 return
 
 
@@ -1091,6 +1161,8 @@ async def selector(items, *, loop=None):
 # Entry Point
 # ------------------------------------------------------------------------------
 def main() -> None:
+    # return
+
     if sys.platform in ('darwin',):
         # kqueue does not support devices
         import selectors

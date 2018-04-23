@@ -765,6 +765,12 @@ class TTY:
     def fileno(self) -> int:
         return self.fd
 
+    def autowrap_set(self, enable):
+        if enable:
+            self.write(b'\033[?7h')
+        else:
+            self.write(b'\033[?7l')
+
     def cursor_to(self, row=0, column=0):
         self.write(f'\x1b[{row};{column}H'.encode())
 
@@ -1091,9 +1097,133 @@ class Text(tuple):
 
 
 # ------------------------------------------------------------------------------
+# Matchers
+# ------------------------------------------------------------------------------
+@apply
+def fuzzy_match():
+    """Fuzzy matching for `fzy` utility
+    """
+    SCORE_MIN = float('-inf')
+    SCORE_MAX = float('inf')
+    SCORE_GAP_LEADING = -0.005
+    SCORE_GAP_TRAILING = -0.005
+    SCORE_GAP_INNER = -0.01
+    SCORE_MATCH_CONSECUTIVE = 1.0
+
+    def char_range_with(c_start, c_stop, v, d):
+        d = d.copy()
+        d.update((chr(c), v) for c in range(ord(c_start), ord(c_stop) + 1))
+        return d
+    lower_with = partial(char_range_with, 'a', 'z')
+    upper_with = partial(char_range_with, 'A', 'Z')
+    digit_with = partial(char_range_with, '0', '9')
+
+    SCORE_MATCH_SLASH = 0.9
+    SCORE_MATCH_WORD = 0.8
+    SCORE_MATCH_CAPITAL = 0.7
+    SCORE_MATCH_DOT = 0.6
+    BONUS_MAP = {
+        '/': SCORE_MATCH_SLASH,
+        '-': SCORE_MATCH_WORD,
+        '_': SCORE_MATCH_WORD,
+        ' ': SCORE_MATCH_WORD,
+        '.': SCORE_MATCH_DOT,
+    }
+    BONUS_STATES = [
+        {},
+        BONUS_MAP,
+        lower_with(SCORE_MATCH_CAPITAL, BONUS_MAP),
+    ]
+    BONUS_INDEX = digit_with(1, lower_with(1, upper_with(2, {})))
+
+    def bonus(haystack):
+        """Additional bonus based on previous char in haystack
+        """
+        c_prev = '/'
+        bonus = []
+        for c in haystack:
+            bonus.append(BONUS_STATES[BONUS_INDEX.get(c, 0)].get(c_prev, 0))
+            c_prev = c
+        return bonus
+
+    def subsequence(niddle, haystack):
+        """Check if niddle is subsequence of haystack
+        """
+        if not niddle:
+            True
+        offset = 0
+        for char in niddle:
+            offset = haystack.find(char, offset)
+            if offset < 0:
+                return False
+        return True
+
+    def score(niddle, haystack):
+        """Calculate score, and positions of haystack
+        """
+        n, m = len(niddle), len(haystack)
+        bonus_score = bonus(haystack)
+        print(bonus_score)
+        niddle, haystack = niddle.lower(), haystack.lower()
+
+        if n == m:
+            return SCORE_MAX
+        D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
+        M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
+        for i in range(n):
+            prev_score = SCORE_MIN
+            gap_score = SCORE_GAP_TRAILING if i == n - 1 else SCORE_GAP_INNER
+
+            for j in range(m):
+                if niddle[i] == haystack[j]:
+                    score = SCORE_MIN
+                    if i == 0:
+                        score = j * SCORE_GAP_LEADING + bonus_score[j]
+                    elif j != 0:
+                        score = max(
+                            M[i - 1][j - 1] + bonus_score[j],
+                            D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE,
+                        )
+                    D[i][j] = score
+                    M[i][j] = prev_score = max(score, prev_score + gap_score)
+                else:
+                    D[i][j] = SCORE_MIN
+                    M[i][j] = prev_score = prev_score + gap_score
+
+        match_required = False
+        position = [0] * n
+        i, j = n, m - 1
+        while i >= 0:
+            i -= 1
+            while j >= 0:
+                if ((match_required or D[i][j] == M[i][j]) and D[i][j] != SCORE_MIN):
+                    match_required = (
+                        i > 0 and
+                        j > 0 and
+                        M[i][j] == D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE
+                    )
+                    position[i] = j
+                    j -= 1
+                    break
+                else:
+                    j -= 1
+
+        return M[n - 1][m - 1], position
+
+    def fuzzy_match(niddle, haystack):
+        if subsequence(niddle, haystack):
+            return score(niddle, haystack)
+        else:
+            return SCORE_MIN, None
+    return fuzzy_match
+
+
+# ------------------------------------------------------------------------------
 # Selector
 # ------------------------------------------------------------------------------
-class Input:
+class InputWidget:
+    __slots__ = ('prompt', 'buffer', 'cursor',)
+
     def __init__(self, prompt=None, buffer=None, cursor=None):
         self.prompt = prompt or ''
         self.buffer = [] if buffer is None else list(buffer)
@@ -1129,32 +1259,86 @@ class Input:
         tty.cursor_backward(len(self.buffer) - self.cursor)
 
 
+class ListWidget:
+    __slots__ = ('items', 'height', 'offset', 'cursor',)
+
+    def __init__(self, items, height):
+        self.items = items
+        self.cursor = 0
+        self.offset = 0
+        self.height = height
+
+    def __call__(self, event):
+        type, attrs = event
+        if type == TTY_KEY:
+            name, mode = attrs
+            if name == 'up':
+                if self.cursor == 0:
+                    self.offset = max(0, self.offset - 1)
+                else:
+                    self.cursor -= 1
+            elif name == 'down':
+                if self.cursor == self.height - 1:
+                    if self.offset < len(self.items) - self.height:
+                        self.offset += 1
+                else:
+                    self.cursor += 1
+
+    def render(self, tty):
+        visible = self.items[self.offset:self.offset + self.height]
+        for index, line in enumerate(visible):
+            if index == self.cursor:
+                tty.write(b' > ')
+            else:
+                tty.write(b'   ')
+            tty.write(line.encode())  # TODO: correct handling
+            tty.erase_line()
+            tty.cursor_to_column(0)
+            tty.cursor_down(1)
+
+
 async def selector(items, *, loop=None):
     face = Face(fg=Color('#ff8040'), attrs=FACE_BOLD)
     header = Text('Press <ctrl-d> to exit\n').mark(6, 14, face)
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
-    input = Input('Input: ')
+
+    input = InputWidget('Input: ')
+    table = ListWidget(os.listdir(os.path.expanduser('~/.config/configs')), 10)
 
     with TTY(loop=loop) as tty:
         # header
         tty.write(bytes(header))
+        tty.autowrap_set(False)
 
-        tty.write(b'\n\n')
-        tty.cursor_up(2)
+        # tty.write(b'\x1b[2S')
+        height = table.height + 2
+        tty.write(b'\n' * height)
+        tty.cursor_up(height)
+
         line, column = await tty.cursor_cpr()
         async for event in tty:
+            if event == ctrl_d:
+                tty.cursor_to(line + height, column)
+                return
+
+            # process events
+            input(event)
+            table(event)
+
+            # show key
             tty.cursor_to(line, column)
             tty.write(f'[{event}]'.encode())
             tty.erase_line()
 
+            # show table
+            tty.cursor_to(line + 2, column)
+            table.render(tty)
+
+            # show input
             tty.cursor_to(line + 1, column)
-            input(event)
             input.render(tty)
 
             tty.flush()
-            if event == ctrl_d:
-                tty.cursor_to(line + 2, column)
-                return
 
 
 # ------------------------------------------------------------------------------

@@ -6,11 +6,13 @@ TODO:
   - use lighter queues?
   - disable signals
   - unittests
-  - more renering modes for `Text` including `bash PS` mode
+  - lighter Text format
+  - fix writer (asynchronous writing)
   - add types
 """
 import array
 import asyncio
+import concurrent.futures
 import fcntl
 import io
 import itertools as it
@@ -757,10 +759,20 @@ class TTY:
                 self.closed.set_exception(error)
 
     def write(self, input: bytes) -> None:
-        self.output.write(input)
+        while True:
+            try:
+                self.output.write(input)
+                break
+            except BlockingIOError:
+                continue
 
     def flush(self) -> None:
-        self.output.flush()
+        while True:
+            try:
+                self.output.flush()
+                break
+            except BlockingIOError:
+                continue
 
     def fileno(self) -> int:
         return self.fd
@@ -1100,8 +1112,10 @@ class Text(tuple):
 # Matchers
 # ------------------------------------------------------------------------------
 @apply
-def fuzzy_match():
+def _fuzzy_scorer():
     """Fuzzy matching for `fzy` utility
+
+    source: https://github.com/jhawthorn/fzy/blob/master/src/match.c
     """
     SCORE_MIN = float('-inf')
     SCORE_MAX = float('inf')
@@ -1149,6 +1163,7 @@ def fuzzy_match():
     def subsequence(niddle, haystack):
         """Check if niddle is subsequence of haystack
         """
+        niddle, haystack = niddle.lower(), haystack.lower()
         if not niddle:
             True
         offset = 0
@@ -1163,11 +1178,10 @@ def fuzzy_match():
         """
         n, m = len(niddle), len(haystack)
         bonus_score = bonus(haystack)
-        print(bonus_score)
         niddle, haystack = niddle.lower(), haystack.lower()
 
-        if n == m:
-            return SCORE_MAX
+        if n == 0 or n == m:
+            return SCORE_MAX, []
         D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
         M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
         for i in range(n):
@@ -1192,9 +1206,8 @@ def fuzzy_match():
 
         match_required = False
         position = [0] * n
-        i, j = n, m - 1
+        i, j = n - 1, m - 1
         while i >= 0:
-            i -= 1
             while j >= 0:
                 if ((match_required or D[i][j] == M[i][j]) and D[i][j] != SCORE_MIN):
                     match_required = (
@@ -1207,27 +1220,65 @@ def fuzzy_match():
                     break
                 else:
                     j -= 1
+            i -= 1
 
         return M[n - 1][m - 1], position
 
-    def fuzzy_match(niddle, haystack):
+    def fuzzy_scorer(niddle, haystack):
         if subsequence(niddle, haystack):
             return score(niddle, haystack)
         else:
             return SCORE_MIN, None
-    return fuzzy_match
+    return fuzzy_scorer
+
+
+def fuzzy_scorer(niddle, haystack):
+    return _fuzzy_scorer(niddle, haystack)
+
+
+def _rank_task(scorer, niddle, haystack, offset):
+    result = []
+    for index, item in enumerate(haystack):
+        score, positions = scorer(niddle, item)
+        if positions is None:
+            continue
+        result.append((-score, item, index + offset, positions))
+    return result
+
+
+async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
+    """Score haystack against niddle in execturo and return sorted result
+    """
+    loop = loop or asyncio.get_event_loop()
+
+    batch_size = 1024
+    batches = await asyncio.gather(*(
+        loop.run_in_executor(
+            executor,
+            _rank_task,
+            scorer,
+            niddle,
+            haystack[offset:offset + batch_size],
+            offset,
+        ) for offset in range(0, len(haystack), batch_size)
+    ))
+    results = [item for batch in batches for item in batch]
+    results.sort()
+
+    return results
 
 
 # ------------------------------------------------------------------------------
 # Selector
 # ------------------------------------------------------------------------------
 class InputWidget:
-    __slots__ = ('prompt', 'buffer', 'cursor',)
+    __slots__ = ('prompt', 'buffer', 'cursor', 'update',)
 
     def __init__(self, prompt=None, buffer=None, cursor=None):
         self.prompt = prompt or ''
         self.buffer = [] if buffer is None else list(buffer)
         self.cursor = len(self.buffer) if cursor is None else cursor
+        self.update = Event()
 
     def __call__(self, event):
         type, attrs = event
@@ -1246,10 +1297,13 @@ class InputWidget:
                     if self.cursor > 0:
                         self.cursor -= 1
                         del self.buffer[self.cursor]
+                        self.update(self.buffer)
                 elif name == 'k':
                     del self.buffer[self.cursor:]
+                    self.update(self.buffer)
         elif type == TTY_CHAR:
             self.buffer.insert(self.cursor, attrs)
+            self.update(self.buffer)
             self.cursor += 1
 
     def render(self, tty):
@@ -1260,13 +1314,14 @@ class InputWidget:
 
 
 class ListWidget:
-    __slots__ = ('items', 'height', 'offset', 'cursor',)
+    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor',)
 
-    def __init__(self, items, height):
+    def __init__(self, items, render_item, height):
         self.items = items
         self.cursor = 0
         self.offset = 0
         self.height = height
+        self.render_item = render_item
 
     def __call__(self, event):
         type, attrs = event
@@ -1278,72 +1333,116 @@ class ListWidget:
                 else:
                     self.cursor -= 1
             elif name == 'down':
-                if self.cursor == self.height - 1:
-                    if self.offset < len(self.items) - self.height:
+                if self.offset + self.cursor + 1 < len(self.items):
+                    if self.cursor + 1 < self.height:
+                        self.cursor += 1
+                    else:
                         self.offset += 1
-                else:
-                    self.cursor += 1
+
+    def reset(self, items):
+        self.cursor = 0
+        self.offset = 0
+        self.items = items
 
     def render(self, tty):
-        visible = self.items[self.offset:self.offset + self.height]
-        for index, line in enumerate(visible):
-            if index == self.cursor:
+        start = self.offset
+        stop = start + self.height
+        for index in range(start, stop):
+            if index == self.cursor + self.offset:
                 tty.write(b' > ')
             else:
                 tty.write(b'   ')
-            tty.write(line.encode())  # TODO: correct handling
+            if index < len(self.items):
+                tty.write(self.render_item(self.items[index]))
             tty.erase_line()
             tty.cursor_to_column(0)
             tty.cursor_down(1)
 
 
-async def selector(items, *, loop=None):
+async def selector(items, executor, *, them=None, loop=None):
+    loop = loop or asyncio.get_event_loop()
+
     face = Face(fg=Color('#ff8040'), attrs=FACE_BOLD)
     header = Text('Press <ctrl-d> to exit\n').mark(6, 14, face)
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
 
+    def item_render(item):
+        score, string, index, positions = item
+        text = Text(string)
+        for position in positions:
+            text = text.mark(position, position + 1, face)
+        return bytes(text)
+
     input = InputWidget('Input: ')
-    table = ListWidget(os.listdir(os.path.expanduser('~/.config/configs')), 10)
+    table = ListWidget([], item_render, 10)
+
+    async def table_update_coro(niddle):
+        niddle = ''.join(niddle)
+        start = time.time()
+        result = await rank(
+            fuzzy_scorer,
+            niddle,
+            items,
+            loop=loop,
+            executor=executor,
+        )
+        stop = time.time()
+        label[1] = f'{len(result)}/{len(items)} {stop - start:.2f}s'
+        table.reset(result)
+        render()
+    import time
+
+    def table_update(niddle):
+        nonlocal table_update_task
+        table_update_task.cancel()
+        table_update_task = asyncio.ensure_future(
+            table_update_coro(niddle))
+        return True
+    table_update_task = loop.create_future()
+    input.update.on(table_update)
+
+    label = ['', '']
+
+    def render():
+        label[0] = f'{event}'
+
+        # render label with pressed key
+        tty.cursor_to(line, column)
+        tty.write(' '.join(label).encode())
+        tty.erase_line()
+        # show table
+        tty.cursor_to(line + 2, column)
+        table.render(tty)
+        # show input
+        tty.cursor_to(line + 1, column)
+        input.render(tty)
+        # flush output
+        tty.flush()
 
     with TTY(loop=loop) as tty:
         # header
         tty.write(bytes(header))
         tty.autowrap_set(False)
 
-        # tty.write(b'\x1b[2S')
         height = table.height + 2
         tty.write(b'\n' * height)
         tty.cursor_up(height)
 
         line, column = await tty.cursor_cpr()
+        table_update('')
         async for event in tty:
             if event == ctrl_d:
                 tty.cursor_to(line + height, column)
                 return
-
-            # process events
             input(event)
             table(event)
-
-            # show key
-            tty.cursor_to(line, column)
-            tty.write(f'[{event}]'.encode())
-            tty.erase_line()
-
-            # show table
-            tty.cursor_to(line + 2, column)
-            table.render(tty)
-
-            # show input
-            tty.cursor_to(line + 1, column)
-            input.render(tty)
-
-            tty.flush()
+            render()
 
 
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
+@debug
 def main() -> None:
     # return
 
@@ -1359,8 +1458,17 @@ def main() -> None:
     import logging
     logging.getLogger('asyncio').setLevel(logging.INFO)
 
+    def subpaths(root):
+        for path, subdir, files in os.walk(root):
+            for file in files:
+                yield os.path.join(path, file)
+
+    executor = concurrent.futures.ProcessPoolExecutor(
+        max_workers=10,
+    )
     try:
-        loop.run_until_complete(selector({}))
+        items = list(subpaths(os.path.expanduser('~/.config/configs')))
+        loop.run_until_complete(selector(items, executor))
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()

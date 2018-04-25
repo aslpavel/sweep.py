@@ -7,7 +7,6 @@ TODO:
   - disable signals
   - unittests
   - lighter Text format
-  - fix writer (asynchronous writing)
   - add types
 """
 import array
@@ -445,13 +444,13 @@ def cont_any(*conts):
 
 def cont_finally(cont, callback):
     """Add `finally` callback to continuation
+
+    Executed on_{done|error} before actual continuation
     """
     def cont_finally(out_done, out_error):
         def with_callback(fn, arg):
-            try:
-                return fn(arg)
-            finally:
-                callback()
+            callback()
+            return fn(arg)
         return cont(partial(with_callback, out_done),
                     partial(with_callback, out_error))
     return cont_finally
@@ -490,6 +489,174 @@ class Event:
             handler(event)
             return False
         self.handlers.append(handler)
+
+    def __await__(self):
+        future = asyncio.Future()
+        self.on_once(future.set_result)
+        return future
+
+
+# ------------------------------------------------------------------------------
+# Matchers
+# ------------------------------------------------------------------------------
+@apply
+def _fuzzy_scorer():
+    """Fuzzy matching for `fzy` utility
+
+    source: https://github.com/jhawthorn/fzy/blob/master/src/match.c
+    """
+    SCORE_MIN = float('-inf')
+    SCORE_MAX = float('inf')
+    SCORE_GAP_LEADING = -0.005
+    SCORE_GAP_TRAILING = -0.005
+    SCORE_GAP_INNER = -0.01
+    SCORE_MATCH_CONSECUTIVE = 1.0
+
+    def char_range_with(c_start, c_stop, v, d):
+        d = d.copy()
+        d.update((chr(c), v) for c in range(ord(c_start), ord(c_stop) + 1))
+        return d
+    lower_with = partial(char_range_with, 'a', 'z')
+    upper_with = partial(char_range_with, 'A', 'Z')
+    digit_with = partial(char_range_with, '0', '9')
+
+    SCORE_MATCH_SLASH = 0.9
+    SCORE_MATCH_WORD = 0.8
+    SCORE_MATCH_CAPITAL = 0.7
+    SCORE_MATCH_DOT = 0.6
+    BONUS_MAP = {
+        '/': SCORE_MATCH_SLASH,
+        '-': SCORE_MATCH_WORD,
+        '_': SCORE_MATCH_WORD,
+        ' ': SCORE_MATCH_WORD,
+        '.': SCORE_MATCH_DOT,
+    }
+    BONUS_STATES = [
+        {},
+        BONUS_MAP,
+        lower_with(SCORE_MATCH_CAPITAL, BONUS_MAP),
+    ]
+    BONUS_INDEX = digit_with(1, lower_with(1, upper_with(2, {})))
+
+    def bonus(haystack):
+        """Additional bonus based on previous char in haystack
+        """
+        c_prev = '/'
+        bonus = []
+        for c in haystack:
+            bonus.append(BONUS_STATES[BONUS_INDEX.get(c, 0)].get(c_prev, 0))
+            c_prev = c
+        return bonus
+
+    def subsequence(niddle, haystack):
+        """Check if niddle is subsequence of haystack
+        """
+        niddle, haystack = niddle.lower(), haystack.lower()
+        if not niddle:
+            True
+        offset = 0
+        for char in niddle:
+            offset = haystack.find(char, offset)
+            if offset < 0:
+                return False
+        return True
+
+    def score(niddle, haystack):
+        """Calculate score, and positions of haystack
+        """
+        n, m = len(niddle), len(haystack)
+        bonus_score = bonus(haystack)
+        niddle, haystack = niddle.lower(), haystack.lower()
+
+        if n == 0 or n == m:
+            return SCORE_MAX, []
+        D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
+        M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
+        for i in range(n):
+            prev_score = SCORE_MIN
+            gap_score = SCORE_GAP_TRAILING if i == n - 1 else SCORE_GAP_INNER
+
+            for j in range(m):
+                if niddle[i] == haystack[j]:
+                    score = SCORE_MIN
+                    if i == 0:
+                        score = j * SCORE_GAP_LEADING + bonus_score[j]
+                    elif j != 0:
+                        score = max(
+                            M[i - 1][j - 1] + bonus_score[j],
+                            D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE,
+                        )
+                    D[i][j] = score
+                    M[i][j] = prev_score = max(score, prev_score + gap_score)
+                else:
+                    D[i][j] = SCORE_MIN
+                    M[i][j] = prev_score = prev_score + gap_score
+
+        match_required = False
+        position = [0] * n
+        i, j = n - 1, m - 1
+        while i >= 0:
+            while j >= 0:
+                if ((match_required or D[i][j] == M[i][j]) and D[i][j] != SCORE_MIN):
+                    match_required = (
+                        i > 0 and
+                        j > 0 and
+                        M[i][j] == D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE
+                    )
+                    position[i] = j
+                    j -= 1
+                    break
+                else:
+                    j -= 1
+            i -= 1
+
+        return M[n - 1][m - 1], position
+
+    def fuzzy_scorer(niddle, haystack):
+        if subsequence(niddle, haystack):
+            return score(niddle, haystack)
+        else:
+            return SCORE_MIN, None
+    return fuzzy_scorer
+
+
+def fuzzy_scorer(niddle, haystack):
+    return _fuzzy_scorer(niddle, haystack)
+
+
+RankResult = namedtuple('RankResult', ('score', 'value', 'index', 'positions'))
+
+
+def _rank_task(scorer, niddle, haystack, offset):
+    result = []
+    for index, item in enumerate(haystack):
+        score, positions = scorer(niddle, item)
+        if positions is None:
+            continue
+        result.append(RankResult(-score, item, index + offset, positions))
+    return result
+
+
+async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
+    """Score haystack against niddle in execturo and return sorted result
+    """
+    loop = loop or asyncio.get_event_loop()
+
+    batch_size = 1024
+    batches = await asyncio.gather(*(
+        loop.run_in_executor(
+            executor,
+            _rank_task,
+            scorer,
+            niddle,
+            haystack[offset:offset + batch_size],
+            offset,
+        ) for offset in range(0, len(haystack), batch_size)
+    ))
+    results = [item for batch in batches for item in batch]
+    results.sort()
+
+    return results
 
 
 # ------------------------------------------------------------------------------
@@ -766,11 +933,11 @@ class TTY:
                     del self.write_queue[:]
                 else:
                     yield wait_queue
-                continue
-            try:
-                data = data[os.write(self.fd, data):]
-            except (BlockingIOError,):
-                yield wait_writable
+            else:
+                try:
+                    data = data[os.write(self.fd, data):]
+                except (BlockingIOError,):
+                    yield wait_writable
 
     def __enter__(self):
         return self
@@ -966,6 +1133,8 @@ FACE_MAP = (
     (FACE_REVERSE, '07;'),
 )
 
+FACE_RENDER_CACHE = {}
+FACE_OVERLAY_CACHE = {}
 
 class Face(tuple):
     __slots__ = tuple()
@@ -974,39 +1143,46 @@ class Face(tuple):
         return tuple.__new__(cls, (fg, bg, attrs))
 
     def overlay(self, other):
-        fg0, bg0, attrs0 = self
-        fg1, bg1, attrs1 = other
-        bg01 = bg1 if bg0 is None else bg0.overlay(bg1)
-        fg01 = fg1 if fg0 is None else fg0.overlay(fg1)
-        if fg01 is not None:
-            fg01 = fg01 if bg01 is None else bg01.overlay(fg01)
-        return Face(fg01, bg01, attrs0 | attrs1)
+        face = FACE_OVERLAY_CACHE.get((self, other))
+        if face is None:
+            fg0, bg0, attrs0 = self
+            fg1, bg1, attrs1 = other
+            bg01 = bg1 if bg0 is None else bg0.overlay(bg1)
+            fg01 = fg1 if fg0 is None else fg0.overlay(fg1)
+            if fg01 is not None:
+                fg01 = fg01 if bg01 is None else bg01.overlay(fg01)
+            face = Face(fg01, bg01, attrs0 | attrs1)
+            FACE_OVERLAY_CACHE[(self, other)] = face
+        return face
 
     fg = property(lambda self: self[0])
     bg = property(lambda self: self[1])
     attrs = property(lambda self: self[2])
 
-    def set(self):
-        fg, bg, attrs = self
-        seq = ['\x1b[']
-        if attrs:
-            for attr, code in FACE_MAP:
-                if attrs & attr:
-                    seq.append(code)
-        if fg:
-            seq.append('38;2;{};{};{};'.format(
-                *(int(c * 255) for c in fg[:3])))
-        if bg:
-            seq.append('48;2;{};{};{};'.format(
-                *(int(c * 255) for c in bg[:3])))
-        seq.append('m')
-        return ''.join(seq)
-
-    def unset(self):
-        return '\x1b[m'
+    def render(self, stream):
+        seq = FACE_RENDER_CACHE.get(self)
+        if seq is None:
+            fg, bg, attrs = self
+            buf = ['\x1b[']
+            if attrs:
+                for attr, code in FACE_MAP:
+                    if attrs & attr:
+                        buf.append(code)
+            if fg:
+                buf.append('38;2;{};{};{};'.format(
+                    *(int(c * 255) for c in fg[:3])))
+            if bg:
+                buf.append('48;2;{};{};{};'.format(
+                    *(int(c * 255) for c in bg[:3])))
+            buf.append('m')
+            seq = ''.join(buf)
+            FACE_RENDER_CACHE[self] = seq
+        stream.write(seq)
 
     def __repr__(self):
-        return f'Face({self.set()} X {self.unset()})'
+        stream = io.StringIO()
+        self.render(stream)
+        return f'Face({stream.getvalue()} X \x1b[m)'
 
 
 TEXT_STRING = 1
@@ -1094,10 +1270,10 @@ class Text(tuple):
         elif type == TEXT_FACE:
             f_text, f_face = value
             f_face = face.overlay(f_face)
-            stream.write(f_face.set())
-            f_text.render(stream, face)
+            f_face.render(stream)
+            f_text.render(stream, f_face)
             stream.write('\x1b[m')
-            stream.write(face.set())
+            face.render(stream)
         elif type == TEXT_LIST:
             for text in value:
                 text.render(stream, face)
@@ -1128,169 +1304,6 @@ class Text(tuple):
         elif type == TEXT_LIST:
             return tuple(t.debug() for t in value)
         assert False, 'unreachable'
-
-
-# ------------------------------------------------------------------------------
-# Matchers
-# ------------------------------------------------------------------------------
-@apply
-def _fuzzy_scorer():
-    """Fuzzy matching for `fzy` utility
-
-    source: https://github.com/jhawthorn/fzy/blob/master/src/match.c
-    """
-    SCORE_MIN = float('-inf')
-    SCORE_MAX = float('inf')
-    SCORE_GAP_LEADING = -0.005
-    SCORE_GAP_TRAILING = -0.005
-    SCORE_GAP_INNER = -0.01
-    SCORE_MATCH_CONSECUTIVE = 1.0
-
-    def char_range_with(c_start, c_stop, v, d):
-        d = d.copy()
-        d.update((chr(c), v) for c in range(ord(c_start), ord(c_stop) + 1))
-        return d
-    lower_with = partial(char_range_with, 'a', 'z')
-    upper_with = partial(char_range_with, 'A', 'Z')
-    digit_with = partial(char_range_with, '0', '9')
-
-    SCORE_MATCH_SLASH = 0.9
-    SCORE_MATCH_WORD = 0.8
-    SCORE_MATCH_CAPITAL = 0.7
-    SCORE_MATCH_DOT = 0.6
-    BONUS_MAP = {
-        '/': SCORE_MATCH_SLASH,
-        '-': SCORE_MATCH_WORD,
-        '_': SCORE_MATCH_WORD,
-        ' ': SCORE_MATCH_WORD,
-        '.': SCORE_MATCH_DOT,
-    }
-    BONUS_STATES = [
-        {},
-        BONUS_MAP,
-        lower_with(SCORE_MATCH_CAPITAL, BONUS_MAP),
-    ]
-    BONUS_INDEX = digit_with(1, lower_with(1, upper_with(2, {})))
-
-    def bonus(haystack):
-        """Additional bonus based on previous char in haystack
-        """
-        c_prev = '/'
-        bonus = []
-        for c in haystack:
-            bonus.append(BONUS_STATES[BONUS_INDEX.get(c, 0)].get(c_prev, 0))
-            c_prev = c
-        return bonus
-
-    def subsequence(niddle, haystack):
-        """Check if niddle is subsequence of haystack
-        """
-        niddle, haystack = niddle.lower(), haystack.lower()
-        if not niddle:
-            True
-        offset = 0
-        for char in niddle:
-            offset = haystack.find(char, offset)
-            if offset < 0:
-                return False
-        return True
-
-    def score(niddle, haystack):
-        """Calculate score, and positions of haystack
-        """
-        n, m = len(niddle), len(haystack)
-        bonus_score = bonus(haystack)
-        niddle, haystack = niddle.lower(), haystack.lower()
-
-        if n == 0 or n == m:
-            return SCORE_MAX, []
-        D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
-        M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
-        for i in range(n):
-            prev_score = SCORE_MIN
-            gap_score = SCORE_GAP_TRAILING if i == n - 1 else SCORE_GAP_INNER
-
-            for j in range(m):
-                if niddle[i] == haystack[j]:
-                    score = SCORE_MIN
-                    if i == 0:
-                        score = j * SCORE_GAP_LEADING + bonus_score[j]
-                    elif j != 0:
-                        score = max(
-                            M[i - 1][j - 1] + bonus_score[j],
-                            D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE,
-                        )
-                    D[i][j] = score
-                    M[i][j] = prev_score = max(score, prev_score + gap_score)
-                else:
-                    D[i][j] = SCORE_MIN
-                    M[i][j] = prev_score = prev_score + gap_score
-
-        match_required = False
-        position = [0] * n
-        i, j = n - 1, m - 1
-        while i >= 0:
-            while j >= 0:
-                if ((match_required or D[i][j] == M[i][j]) and D[i][j] != SCORE_MIN):
-                    match_required = (
-                        i > 0 and
-                        j > 0 and
-                        M[i][j] == D[i - 1][j - 1] + SCORE_MATCH_CONSECUTIVE
-                    )
-                    position[i] = j
-                    j -= 1
-                    break
-                else:
-                    j -= 1
-            i -= 1
-
-        return M[n - 1][m - 1], position
-
-    def fuzzy_scorer(niddle, haystack):
-        if subsequence(niddle, haystack):
-            return score(niddle, haystack)
-        else:
-            return SCORE_MIN, None
-    return fuzzy_scorer
-
-
-def fuzzy_scorer(niddle, haystack):
-    return _fuzzy_scorer(niddle, haystack)
-
-
-RankResult = namedtuple('RankResult', ('score', 'value', 'index', 'positions'))
-
-
-def _rank_task(scorer, niddle, haystack, offset):
-    result = []
-    for index, item in enumerate(haystack):
-        score, positions = scorer(niddle, item)
-        if positions is None:
-            continue
-        result.append(RankResult(-score, item, index + offset, positions))
-    return result
-
-
-async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
-    """Score haystack against niddle in execturo and return sorted result
-    """
-    loop = loop or asyncio.get_event_loop()
-
-    batch_size = 1024
-    batches = await asyncio.gather(*(
-        loop.run_in_executor(
-            executor,
-            _rank_task,
-            scorer,
-            niddle,
-            haystack[offset:offset + batch_size],
-            offset,
-        ) for offset in range(0, len(haystack), batch_size)
-    ))
-    results = [item for batch in batches for item in batch]
-    results.sort()
-
-    return results
 
 
 # ------------------------------------------------------------------------------
@@ -1507,8 +1520,15 @@ def main() -> None:
     import logging
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--prompt', help='prompt label')
-    parser.add_argument('-d', '--debug', help='enable debugging')
+    parser.add_argument(
+        '-p', '--prompt',
+        help='prompt label',
+    )
+    parser.add_argument(
+        '-d', '--debug',
+        action='store_true',
+        help='enable debugging',
+    )
     options = parser.parse_args()
 
     if sys.platform in ('darwin',):
@@ -1516,7 +1536,6 @@ def main() -> None:
         import selectors
         asyncio.set_event_loop(
             asyncio.SelectorEventLoop(selectors.SelectSelector()))
-
     loop = asyncio.get_event_loop()
     if options.debug:
         loop.set_debug(True)

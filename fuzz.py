@@ -624,7 +624,7 @@ def fuzzy_scorer(niddle, haystack):
     return _fuzzy_scorer(niddle, haystack)
 
 
-RankResult = namedtuple('RankResult', ('score', 'value', 'index', 'positions'))
+RankResult = namedtuple('RankResult', ('score', 'index', 'haystack', 'positions'))
 
 
 def _rank_task(scorer, niddle, haystack, offset):
@@ -633,7 +633,7 @@ def _rank_task(scorer, niddle, haystack, offset):
         score, positions = scorer(niddle, item)
         if positions is None:
             continue
-        result.append(RankResult(-score, item, index + offset, positions))
+        result.append(RankResult(-score, index + offset, item, positions))
     return result
 
 
@@ -652,7 +652,7 @@ async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
             haystack[offset:offset + batch_size],
             offset,
         ) for offset in range(0, len(haystack), batch_size)
-    ))
+    ), loop=loop)
     results = [item for batch in batches for item in batch]
     results.sort()
 
@@ -1460,11 +1460,10 @@ async def selector(
     ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
     def item_render(tty, face, item):
-        score, string, index, positions = item
-        text = Text(string)
-        for position in positions:
+        text = Text(item.haystack)
+        for position in item.positions:
             text = text.mark(face_match, position, position + 1)
-        return text.render(tty, face)
+        text.render(tty, face)
 
     prompt = Text(' input ').mark(face_prompt) + Text('\ue0b0 ').mark(face_prompt.invert())
     input = InputWidget(prompt)

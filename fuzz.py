@@ -12,7 +12,7 @@ TODO:
 """
 import array
 import asyncio
-
+import codecs
 import fcntl
 import io
 import itertools as it
@@ -27,7 +27,7 @@ import time
 import traceback
 import tty
 import warnings
-from collections import namedtuple, deque
+from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
 from functools import (partial, reduce)
 
@@ -663,7 +663,7 @@ class TTY:
         self.events.on(events_queue_handler)
 
         self.write_event = Event()
-        self.write_queue = deque()
+        self.write_queue = []
 
         self.closed = self.loop.create_future()
         cont_run(self._closer(), name='TTY._closer')
@@ -720,10 +720,10 @@ class TTY:
         finally:
             # remove resize handler
             self.loop.remove_signal_handler(signal.SIGWINCH)
-            # restore tty attributes
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
             # terminate queue
             self.events_queue.put_nowait(TTYEvent(TTY_CLOSE, None))
+            # restore tty attributes
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
             # unregister descriptor
             os.set_blocking(self.fd, True)
             self.write_event(None)
@@ -744,6 +744,12 @@ class TTY:
                 self.events(event)
         return True  # keep subscrbied
 
+    def write(self, input: str) -> None:
+        self.write_queue.append(input)
+
+    def flush(self) -> None:
+        self.write_event(None)
+
     @coro
     def _writer(self):
         wait_queue = cont(self.write_event.on_once)
@@ -751,19 +757,19 @@ class TTY:
             cont(partial(self.loop.add_writer, self.fd)),
             partial(self.loop.remove_writer, self.fd),
         )
+        encode = codecs.getencoder('utf-8')
+        data = b''
         while True:
-            if not self.write_queue:
-                yield wait_queue
+            if not data:
+                if self.write_queue:
+                    data, _ = encode(''.join(self.write_queue))
+                    del self.write_queue[:]
+                else:
+                    yield wait_queue
                 continue
-
             try:
-                chunk = self.write_queue.pop()
-                chunk = chunk[os.write(self.fd, chunk):]
-                if chunk:
-                    self.write_queue.append(chunk)
-                continue
+                data = data[os.write(self.fd, data):]
             except (BlockingIOError,):
-                self.write_queue.append(chunk)
                 yield wait_writable
 
     def __enter__(self):
@@ -793,31 +799,25 @@ class TTY:
             else:
                 self.closed.set_exception(error)
 
-    def write(self, input: bytes) -> None:
-        self.write_queue.appendleft(input)
-
-    def flush(self) -> None:
-        self.write_event(None)
-
     def fileno(self) -> int:
         return self.fd
 
     def autowrap_set(self, enable):
         if enable:
-            self.write(b'\033[?7h')
+            self.write('\033[?7h')
         else:
-            self.write(b'\033[?7l')
+            self.write('\033[?7l')
 
     def cursor_to(self, row=0, column=0):
-        self.write(f'\x1b[{row};{column}H'.encode())
+        self.write(f'\x1b[{row};{column}H')
 
     def cursor_up(self, count: int) -> None:
         if count == 0:
             pass
         elif count == 1:
-            self.write(b'\x1b[A')
+            self.write('\x1b[A')
         elif count > 1:
-            self.write(f'\x1b[{count}A'.encode())
+            self.write(f'\x1b[{count}A')
         else:
             self.cursor_down(-count)
 
@@ -825,17 +825,17 @@ class TTY:
         if count == 0:
             pass
         elif count == 1:
-            self.write(b'\x1b[B')
+            self.write('\x1b[B')
         elif count > 1:
-            self.write(f'\x1b[{count}B'.encode())
+            self.write('\x1b[{count}B')
         else:
             self.cursor_up(-count)
 
     def cursor_to_column(self, index: int) -> None:
         if index == 0:
-            self.write(b'\x1b[G')
+            self.write('\x1b[G')
         elif index > 1:
-            self.write(f'\x1b[{index}G'.encode())
+            self.write('\x1b[{index}G')
         else:
             raise ValueError(f'column index can not be negative: {index}')
 
@@ -843,9 +843,9 @@ class TTY:
         if count == 0:
             pass
         elif count == 1:
-            self.write(b'\x1b[C')
+            self.write('\x1b[C')
         elif count > 1:
-            self.write(f'\x1b[{count}C'.encode())
+            self.write(f'\x1b[{count}C')
         else:
             self.cursor_backward(-count)
 
@@ -853,9 +853,9 @@ class TTY:
         if count == 0:
             pass
         elif count == 1:
-            self.write(b'\x1b[D')
+            self.write('\x1b[D')
         elif count > 1:
-            self.write(f'\x1b[{count}D'.encode())
+            self.write(f'\x1b[{count}D')
         else:
             self.cursor_forward(-count)
 
@@ -870,27 +870,22 @@ class TTY:
         cpr = self.loop.create_future()
         self.events.on(cpr_handler)
 
-        self.write(b'\x1b[6n')
+        self.write('\x1b[6n')
         self.flush()
 
         return await cpr
 
     def cursor_hide(self):
-        self.write(b'\x1b[?25l')
+        self.write('\x1b[?25l')
 
     def cursor_show(self):
-        self.write(b'\x1b[?12l\x1b[?25h')
+        self.write('\x1b[?12l\x1b[?25h')
 
     def erase_line(self) -> None:
-        self.write(b'\x1b[K')
+        self.write('\x1b[K')
 
     def erase_down(self):
-        self.write(b'\x1b[J')
-
-    def format(self, text):
-        """Write formatted text
-
-        """
+        self.write('\x1b[J')
 
 
 # ------------------------------------------------------------------------------
@@ -1337,8 +1332,8 @@ class InputWidget:
             self.cursor += 1
 
     def render(self, tty):
-        tty.write(bytes(self.prompt))
-        tty.write(''.join(self.buffer).encode())
+        self.prompt.render(tty)
+        tty.write(''.join(self.buffer))
         tty.erase_line()
         tty.cursor_backward(len(self.buffer) - self.cursor)
 
@@ -1387,11 +1382,11 @@ class ListWidget:
         stop = start + self.height
         for index in range(start, stop):
             if index == self.cursor + self.offset:
-                tty.write(b' > ')
+                tty.write(' > ')
             else:
-                tty.write(b'   ')
+                tty.write('   ')
             if index < len(self.items):
-                tty.write(self.render_item(self.items[index]))
+                self.render_item(tty, self.items[index])
             tty.erase_line()
             tty.cursor_to_column(0)
             tty.cursor_down(1)
@@ -1422,12 +1417,12 @@ async def selector(
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
     ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
-    def item_render(item):
+    def item_render(tty, item):
         score, string, index, positions = item
         text = Text(string)
         for position in positions:
             text = text.mark(face_match, position, position + 1)
-        return bytes(text)
+        return text.render(tty)
 
     input = InputWidget(Text('Input: ').mark(face_prompt))
     table = ListWidget([], item_render, 10)
@@ -1463,7 +1458,7 @@ async def selector(
 
         # render label with pressed key
         tty.cursor_to(line, column)
-        tty.write(' '.join(label).encode())
+        tty.write(' '.join(label))
         tty.erase_line()
         # show table
         tty.cursor_to(line + 2, column)
@@ -1476,11 +1471,11 @@ async def selector(
 
     with TTY(loop=loop) as tty:
         # header
-        tty.write(bytes(header))
+        header.render(tty)
         tty.autowrap_set(False)
 
         height = table.height + 2
-        tty.write(b'\n' * height)
+        tty.write('\n' * height)
         tty.cursor_up(height)
 
         line, column = await tty.cursor_cpr()

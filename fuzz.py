@@ -12,7 +12,7 @@ TODO:
 """
 import array
 import asyncio
-import concurrent.futures
+
 import fcntl
 import io
 import itertools as it
@@ -23,9 +23,12 @@ import signal
 import string
 import sys
 import termios
+import time
 import traceback
 import tty
 import warnings
+from collections import namedtuple, deque
+from concurrent.futures import ProcessPoolExecutor
 from functools import (partial, reduce)
 
 from typing import (
@@ -635,7 +638,10 @@ class TTYParser:
 
 
 class TTY:
-    __slots__ = ('fd', 'size', 'output', 'events', 'events_queue', 'loop', 'closed',)
+    __slots__ = (
+        'fd', 'size', 'events', 'events_queue', 'loop', 'closed',
+        'write_queue', 'write_event',
+    )
     DEFAULT_FILE = '/dev/tty'
 
     def __init__(self, file: Union[int, str] = None, *, loop=None) -> None:
@@ -646,7 +652,6 @@ class TTY:
         assert os.isatty(self.fd), f'file must be a tty: {file}'
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
-        self.output = open(self.fd, mode='wb', closefd=False)
         self.events = Event()
 
         def events_queue_handler(event):
@@ -656,6 +661,9 @@ class TTY:
             return True  # keep subscribed
         self.events_queue = asyncio.Queue()
         self.events.on(events_queue_handler)
+
+        self.write_event = Event()
+        self.write_queue = deque()
 
         self.closed = self.loop.create_future()
         cont_run(self._closer(), name='TTY._closer')
@@ -704,18 +712,23 @@ class TTY:
             self.loop.add_reader(self.fd, lambda: readable(None))
             readable.on(partial(self._try_read, parser))
 
+            # writer
+            cont_run(self._writer(), name='TTY._writer')
+
             # wait closed event
             yield cont_from_future(self.closed)
         finally:
-            self.output.flush()
             # remove resize handler
             self.loop.remove_signal_handler(signal.SIGWINCH)
             # restore tty attributes
             termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
             # terminate queue
             self.events_queue.put_nowait(TTYEvent(TTY_CLOSE, None))
-            # stop reader
+            # unregister descriptor
+            os.set_blocking(self.fd, True)
+            self.write_event(None)
             self.loop.remove_reader(self.fd)
+            self.loop.remove_writer(self.fd)
             os.close(self.fd)
 
     def _try_read(self, parser, _):
@@ -730,6 +743,28 @@ class TTY:
             for event in events:
                 self.events(event)
         return True  # keep subscrbied
+
+    @coro
+    def _writer(self):
+        wait_queue = cont(self.write_event.on_once)
+        wait_writable = cont_finally(
+            cont(partial(self.loop.add_writer, self.fd)),
+            partial(self.loop.remove_writer, self.fd),
+        )
+        while True:
+            if not self.write_queue:
+                yield wait_queue
+                continue
+
+            try:
+                chunk = self.write_queue.pop()
+                chunk = chunk[os.write(self.fd, chunk):]
+                if chunk:
+                    self.write_queue.append(chunk)
+                continue
+            except (BlockingIOError,):
+                self.write_queue.append(chunk)
+                yield wait_writable
 
     def __enter__(self):
         return self
@@ -759,20 +794,10 @@ class TTY:
                 self.closed.set_exception(error)
 
     def write(self, input: bytes) -> None:
-        while True:
-            try:
-                self.output.write(input)
-                break
-            except BlockingIOError:
-                continue
+        self.write_queue.appendleft(input)
 
     def flush(self) -> None:
-        while True:
-            try:
-                self.output.flush()
-                break
-            except BlockingIOError:
-                continue
+        self.write_event(None)
 
     def fileno(self) -> int:
         return self.fd
@@ -1032,9 +1057,11 @@ class Text(tuple):
         else:
             raise ValueError('text indices must be integers')
 
-    def mark(self, start, end, face=Face()):
+    def mark(self, face, start=None, stop=None):
+        start = start or 0
+        stop = stop or len(self) - 1
         left, middle = self.split(start)
-        middle, right = middle.split(end - start)
+        middle, right = middle.split(stop - start)
         return Text((left, Text((middle, face), TEXT_FACE), right), TEXT_LIST)
 
     def split(self, index):
@@ -1236,13 +1263,16 @@ def fuzzy_scorer(niddle, haystack):
     return _fuzzy_scorer(niddle, haystack)
 
 
+RankResult = namedtuple('RankResult', ('score', 'value', 'index', 'positions'))
+
+
 def _rank_task(scorer, niddle, haystack, offset):
     result = []
     for index, item in enumerate(haystack):
         score, positions = scorer(niddle, item)
         if positions is None:
             continue
-        result.append((-score, item, index + offset, positions))
+        result.append(RankResult(-score, item, index + offset, positions))
     return result
 
 
@@ -1275,7 +1305,7 @@ class InputWidget:
     __slots__ = ('prompt', 'buffer', 'cursor', 'update',)
 
     def __init__(self, prompt=None, buffer=None, cursor=None):
-        self.prompt = prompt or ''
+        self.prompt = prompt or Text('')
         self.buffer = [] if buffer is None else list(buffer)
         self.cursor = len(self.buffer) if cursor is None else cursor
         self.update = Event()
@@ -1307,7 +1337,7 @@ class InputWidget:
             self.cursor += 1
 
     def render(self, tty):
-        tty.write(self.prompt.encode())
+        tty.write(bytes(self.prompt))
         tty.write(''.join(self.buffer).encode())
         tty.erase_line()
         tty.cursor_backward(len(self.buffer) - self.cursor)
@@ -1339,6 +1369,14 @@ class ListWidget:
                     else:
                         self.offset += 1
 
+    @property
+    def selected(self):
+        current = self.offset + self.cursor
+        if current < len(self.items):
+            return self.items[current]
+        else:
+            return None
+
     def reset(self, items):
         self.cursor = 0
         self.offset = 0
@@ -1359,21 +1397,39 @@ class ListWidget:
             tty.cursor_down(1)
 
 
-async def selector(items, executor, *, them=None, loop=None):
+SELECTOR_THEME = {
+    'prompt': Face(bg=Color('#458588')),
+    'match': Face(bg=Color('#d65d0e')),
+    'selected': Face(bg=Color('#3c3836')),
+    'default': Face(bg=Color('#282828')),
+}
+
+
+async def selector(
+    items,
+    executor,
+    *,
+    loop=None,
+    theme=None
+):
     loop = loop or asyncio.get_event_loop()
+    theme = theme or {}
+    face_prompt = theme.get('prompt', SELECTOR_THEME['prompt'])
+    face_match = theme.get('match', SELECTOR_THEME['match'])
 
     face = Face(fg=Color('#ff8040'), attrs=FACE_BOLD)
-    header = Text('Press <ctrl-d> to exit\n').mark(6, 14, face)
+    header = Text('Press <ctrl-d> to exit\n').mark(face, 6, 14)
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
+    ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
     def item_render(item):
         score, string, index, positions = item
         text = Text(string)
         for position in positions:
-            text = text.mark(position, position + 1, face)
+            text = text.mark(face_match, position, position + 1)
         return bytes(text)
 
-    input = InputWidget('Input: ')
+    input = InputWidget(Text('Input: ').mark(face_prompt))
     table = ListWidget([], item_render, 10)
 
     async def table_update_coro(niddle):
@@ -1390,7 +1446,6 @@ async def selector(items, executor, *, them=None, loop=None):
         label[1] = f'{len(result)}/{len(items)} {stop - start:.2f}s'
         table.reset(result)
         render()
-    import time
 
     def table_update(niddle):
         nonlocal table_update_task
@@ -1430,21 +1485,36 @@ async def selector(items, executor, *, them=None, loop=None):
 
         line, column = await tty.cursor_cpr()
         table_update('')
+        result = -1
         async for event in tty:
             if event == ctrl_d:
-                tty.cursor_to(line + height, column)
-                return
+                break
+            elif event == ctrl_m:
+                selected = table.selected
+                result = -1 if selected is None else selected.index
+                break
             input(event)
             table(event)
             render()
+
+        tty.cursor_to(line - 1, column)
+        tty.erase_down()
+        tty.autowrap_set(True)
+        table_update_task.cancel()
+        return result
 
 
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
-@debug
 def main() -> None:
-    # return
+    import argparse
+    import logging
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--prompt', help='prompt label')
+    parser.add_argument('-d', '--debug', help='enable debugging')
+    options = parser.parse_args()
 
     if sys.platform in ('darwin',):
         # kqueue does not support devices
@@ -1452,23 +1522,22 @@ def main() -> None:
         asyncio.set_event_loop(
             asyncio.SelectorEventLoop(selectors.SelectSelector()))
 
-    # TODO: remove debugging
     loop = asyncio.get_event_loop()
-    loop.set_debug(True)
-    import logging
-    logging.getLogger('asyncio').setLevel(logging.INFO)
+    if options.debug:
+        loop.set_debug(True)
+        logging.getLogger('asyncio').setLevel(logging.INFO)
 
     def subpaths(root):
         for path, subdir, files in os.walk(root):
             for file in files:
                 yield os.path.join(path, file)
+    items = list(subpaths(os.path.expanduser('~/.config/configs')))
 
-    executor = concurrent.futures.ProcessPoolExecutor(
-        max_workers=10,
-    )
     try:
-        items = list(subpaths(os.path.expanduser('~/.config/configs')))
-        loop.run_until_complete(selector(items, executor))
+        with ProcessPoolExecutor(max_workers=5) as executor:
+            selected = loop.run_until_complete(selector(items, executor))
+        if selected >= 0:
+            print(items[selected])
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()

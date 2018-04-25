@@ -1155,6 +1155,10 @@ class Face(tuple):
             FACE_OVERLAY_CACHE[(self, other)] = face
         return face
 
+    def invert(self):
+        fg, bg, attrs = self
+        return Face(bg, fg, attrs)
+
     fg = property(lambda self: self[0])
     bg = property(lambda self: self[1])
     attrs = property(lambda self: self[2])
@@ -1230,7 +1234,7 @@ class Text(tuple):
 
     def mark(self, face, start=None, stop=None):
         start = start or 0
-        stop = stop or len(self) - 1
+        stop = stop or len(self)
         left, middle = self.split(start)
         middle, right = middle.split(stop - start)
         return Text((left, Text((middle, face), TEXT_FACE), right), TEXT_LIST)
@@ -1308,7 +1312,23 @@ class Text(tuple):
 
 # ------------------------------------------------------------------------------
 # Selector
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+THEME_DEFAULT = {
+    'prompt': Face(bg=Color('#458588')),
+    'match': Face(bg=Color('#d65d0e')),
+    'list_selected': Face(bg=Color('#3c3836')),
+    'list_default': Face(bg=Color('#282828')),
+}
+
+
+def get_face(name, theme=None):
+    """Get face with specified name from theme
+    """
+    if theme is None:
+        theme = THEME_DEFAULT
+    return theme.get(name) or THEME_DEFAULT[name]
+
+
 class InputWidget:
     __slots__ = ('prompt', 'buffer', 'cursor', 'update',)
 
@@ -1352,14 +1372,15 @@ class InputWidget:
 
 
 class ListWidget:
-    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor',)
+    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor', 'theme',)
 
-    def __init__(self, items, render_item, height):
+    def __init__(self, items, render_item, height, theme=None):
         self.items = items
         self.cursor = 0
         self.offset = 0
         self.height = height
         self.render_item = render_item
+        self.theme = None
 
     def __call__(self, event):
         type, attrs = event
@@ -1395,22 +1416,18 @@ class ListWidget:
         stop = start + self.height
         for index in range(start, stop):
             if index == self.cursor + self.offset:
-                tty.write(' > ')
+                face = get_face('list_selected', self.theme)
+                face.render(tty)
+                tty.write(' \u25cf ')
             else:
+                face = get_face('list_default', self.theme)
+                face.render(tty)
                 tty.write('   ')
             if index < len(self.items):
-                self.render_item(tty, self.items[index])
+                self.render_item(tty, face, self.items[index])
             tty.erase_line()
             tty.cursor_to_column(0)
             tty.cursor_down(1)
-
-
-SELECTOR_THEME = {
-    'prompt': Face(bg=Color('#458588')),
-    'match': Face(bg=Color('#d65d0e')),
-    'selected': Face(bg=Color('#3c3836')),
-    'default': Face(bg=Color('#282828')),
-}
 
 
 async def selector(
@@ -1421,24 +1438,22 @@ async def selector(
     theme=None
 ):
     loop = loop or asyncio.get_event_loop()
-    theme = theme or {}
-    face_prompt = theme.get('prompt', SELECTOR_THEME['prompt'])
-    face_match = theme.get('match', SELECTOR_THEME['match'])
+    face_prompt = get_face('prompt', theme)
+    face_match = get_face('match', theme)
 
-    face = Face(fg=Color('#ff8040'), attrs=FACE_BOLD)
-    header = Text('Press <ctrl-d> to exit\n').mark(face, 6, 14)
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
     ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
-    def item_render(tty, item):
+    def item_render(tty, face, item):
         score, string, index, positions = item
         text = Text(string)
         for position in positions:
             text = text.mark(face_match, position, position + 1)
-        return text.render(tty)
+        return text.render(tty, face)
 
-    input = InputWidget(Text('Input: ').mark(face_prompt))
-    table = ListWidget([], item_render, 10)
+    prompt = Text(' input ').mark(face_prompt) + Text('\ue0b0 ').mark(face_prompt.invert())
+    input = InputWidget(prompt)
+    table = ListWidget([], item_render, 10, theme)
 
     async def table_update_coro(niddle):
         niddle = ''.join(niddle)
@@ -1467,10 +1482,10 @@ async def selector(
     label = ['', '']
 
     def render():
-        label[0] = f'{event}'
-
-        # render label with pressed key
         tty.cursor_to(line, column)
+        tty.erase_down()
+        # render label with pressed key
+        label[0] = f'{event}'
         tty.write(' '.join(label))
         tty.erase_line()
         # show table
@@ -1483,8 +1498,6 @@ async def selector(
         tty.flush()
 
     with TTY(loop=loop) as tty:
-        # header
-        header.render(tty)
         tty.autowrap_set(False)
 
         height = table.height + 2
@@ -1493,6 +1506,7 @@ async def selector(
 
         line, column = await tty.cursor_cpr()
         table_update('')
+
         result = -1
         async for event in tty:
             if event == ctrl_d:
@@ -1505,10 +1519,11 @@ async def selector(
             table(event)
             render()
 
-        tty.cursor_to(line - 1, column)
+        tty.cursor_to(line, column)
         tty.erase_down()
         tty.autowrap_set(True)
         table_update_task.cancel()
+
         return result
 
 

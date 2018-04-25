@@ -26,7 +26,7 @@ import time
 import traceback
 import tty
 import warnings
-from collections import namedtuple
+from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
 from functools import (partial, reduce)
 
@@ -807,7 +807,7 @@ class TTYParser:
 class TTY:
     __slots__ = (
         'fd', 'size', 'events', 'events_queue', 'loop', 'closed',
-        'write_queue', 'write_event',
+        'write_queue', 'write_event', 'write_buffer',
     )
     DEFAULT_FILE = '/dev/tty'
 
@@ -829,8 +829,9 @@ class TTY:
         self.events_queue = asyncio.Queue()
         self.events.on(events_queue_handler)
 
+        self.write_buffer = io.StringIO()
         self.write_event = Event()
-        self.write_queue = []
+        self.write_queue = deque()
 
         self.closed = self.loop.create_future()
         cont_run(self._closer(), name='TTY._closer')
@@ -903,7 +904,7 @@ class TTY:
             chunk = os.read(self.fd, 1024)
             if not chunk:
                 return False  # unsubsribe
-        except (BlockingIOError,):
+        except BlockingIOError:
             pass
         else:
             events = parser(chunk)
@@ -912,9 +913,13 @@ class TTY:
         return True  # keep subscrbied
 
     def write(self, input: str) -> None:
-        self.write_queue.append(input)
+        self.write_buffer.write(input)
 
     def flush(self) -> None:
+        frame = self.write_buffer.getvalue()
+        self.write_buffer.truncate(0)
+        self.write_buffer.seek(0)
+        self.write_queue.append(frame)
         self.write_event(None)
 
     @coro
@@ -925,19 +930,24 @@ class TTY:
             partial(self.loop.remove_writer, self.fd),
         )
         encode = codecs.getencoder('utf-8')
-        data = b''
+        frame = b''
         while True:
-            if not data:
+            if not frame:
                 if self.write_queue:
-                    data, _ = encode(''.join(self.write_queue))
-                    del self.write_queue[:]
+                    frame, _ = encode(self.write_queue.popleft())
                 else:
                     yield wait_queue
             else:
                 try:
-                    data = data[os.write(self.fd, data):]
-                except (BlockingIOError,):
+                    frame = frame[os.write(self.fd, frame):]
+                except BlockingIOError:
                     yield wait_writable
+                    if self.write_queue:
+                        # removing all but last frame, assuming flush is called
+                        # on whole frame barrier.
+                        frame_last = self.write_queue.pop()
+                        self.write_queue.clear()
+                        self.write_queue.append(frame_last)
 
     def __enter__(self):
         return self
@@ -1037,8 +1047,13 @@ class TTY:
         cpr = self.loop.create_future()
         self.events.on(cpr_handler)
 
-        self.write('\x1b[6n')
-        self.flush()
+        # doing direct write as frame might be dropped by writer
+        request = b'\x1b[6n'
+        while request:
+            try:
+                request = request[os.write(self.fd, b'\x1b[6n'):]
+            except BlockingIOError:
+                pass
 
         return await cpr
 
@@ -1522,6 +1537,7 @@ async def selector(
         tty.cursor_to(line, column)
         tty.erase_down()
         tty.autowrap_set(True)
+        tty.flush()
         table_update_task.cancel()
 
         return result

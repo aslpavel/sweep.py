@@ -1335,13 +1335,19 @@ class Text:
 # ------------------------------------------------------------------------------
 # Selector
 # -----------------------------------------------------------------------------
+COLOR_BASE = Color('#458588')
+COLOR_BG = Color('#32302f')
+COLOR_FG = Color('#ebdbb2')
 THEME_DEFAULT = {
-    'prompt': Face(bg=Color('#458588')),
-    'match': Face(bg=Color('#d65d0e')),
-    'list-selected': Face(bg=Color('#3c3836')),
-    'list-default': Face(bg=Color('#282828')),
-    'list-scrollbar-on': Face(bg=Color('#458588').with_alpha(.8)),
-    'list-scrollbar-off': Face(bg=Color('#458588').with_alpha(.4)),
+    'base-bg': Face(fg=COLOR_FG, bg=COLOR_BASE),
+    'base-fg': Face(fg=COLOR_BASE, bg=COLOR_BG),
+    'match': Face(fg=COLOR_FG, bg=Color('#d65d0e')),
+    'input-default': Face(fg=COLOR_FG, bg=COLOR_BG),
+    'list-dot': Face(fg=COLOR_BASE),
+    'list-selected': Face(fg=Color('#d5c4a1'), bg=Color('#3c3836')),
+    'list-default': Face(fg=Color('#d5c4a1'), bg=COLOR_BG),
+    'list-scrollbar-on': Face(bg=COLOR_BASE.with_alpha(.8)),
+    'list-scrollbar-off': Face(bg=COLOR_BASE.with_alpha(.4)),
 }
 
 
@@ -1395,7 +1401,8 @@ class InputWidget:
     def set_suffix(self, suffix):
         self.suffix = suffix
 
-    def render(self, tty):
+    def render(self, tty, theme=None):
+        get_face('input-default', theme).render(tty)
         tty.erase_line()
         self.prefix.render(tty)
         tty.write(''.join(self.buffer))
@@ -1405,15 +1412,14 @@ class InputWidget:
 
 
 class ListWidget:
-    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor', 'theme',)
+    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor',)
 
-    def __init__(self, items, render_item, height, theme=None):
+    def __init__(self, items, render_item, height):
         self.items = items
         self.cursor = 0
         self.offset = 0
         self.height = height
         self.render_item = render_item
-        self.theme = None
 
     def __call__(self, event):
         type, attrs = event
@@ -1468,11 +1474,12 @@ class ListWidget:
         self.offset = 0
         self.items = items
 
-    def render(self, tty):
-        face_selected = get_face('list-selected', self.theme)
-        face_default = get_face('list-default', self.theme)
-        face_scrollbar_on = get_face('list-scrollbar-on', self.theme)
-        face_scrollbar_off = get_face('list-scrollbar-off', self.theme)
+    def render(self, tty, theme=None):
+        face_selected = get_face('list-selected', theme)
+        face_default = get_face('list-default', theme)
+        face_scrollbar_on = get_face('list-scrollbar-on', theme)
+        face_scrollbar_off = get_face('list-scrollbar-off', theme)
+        face_dot = get_face('list-dot')
 
         # scroll bar
         scrollbar = [False] * self.height
@@ -1489,7 +1496,7 @@ class ListWidget:
             if line == self.cursor:
                 face = face_selected
                 face.render(tty)
-                tty.write(' \u25cf ')
+                Text(' \u25cf ').mark(face_dot).render(tty, face)
             else:
                 face = face_default
                 face.render(tty)
@@ -1515,16 +1522,19 @@ class ListWidget:
 async def selector(
     items,
     *,
+    height=None,
     prompt=None,
     tty=None,
     executor=None,
     loop=None,
     theme=None
 ):
-    loop = loop or asyncio.get_event_loop()
     prompt = prompt or 'input'
+    height = height or 10
+    loop = loop or asyncio.get_event_loop()
 
-    face_prompt = get_face('prompt', theme)
+    face_base_fg = get_face('base-fg', theme)
+    face_base_bg = get_face('base-bg', theme)
     face_match = get_face('match', theme)
 
     def render_item(tty, width, face, item):
@@ -1532,12 +1542,12 @@ async def selector(
         text.mark_mask(face_match, item.positions)[:width].render(tty, face)
 
     prefix = reduce(op.add, (
-        Text(f' {prompt} ').mark(face_prompt),
-        Text('\ue0b0 ').mark(face_prompt.invert()),
+        Text(f' {prompt} ').mark(face_base_bg),
+        Text('\ue0b0 ').mark(face_base_fg),
     ))
     input = InputWidget()
     input.set_prefix(prefix)
-    table = ListWidget([], render_item, 10, theme)
+    table = ListWidget([], render_item, height)
 
     async def table_update_coro(niddle):
         niddle = ''.join(niddle)
@@ -1551,10 +1561,10 @@ async def selector(
         )
         stop = time.time()
         input.set_suffix(
-            Text(' \ue0b2').mark(face_prompt.invert()) +
+            Text(' \ue0b2').mark(face_base_fg) +
             Text(
                 f' {len(result)}/{len(items)} {stop - start:.2f}s '
-            ).mark(face_prompt)
+            ).mark(face_base_bg)
         )
         table.reset(result)
         render()
@@ -1573,7 +1583,7 @@ async def selector(
         tty.erase_down()
         # show table
         tty.cursor_to(line + 1, column)
-        table.render(tty)
+        table.render(tty, theme)
         # show input
         tty.cursor_to(line, column)
         input.render(tty)

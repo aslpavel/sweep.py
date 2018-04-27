@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Swiper for console
+"""Sweep is a command line fuzzy finer (fzf analog)
 
 TODO:
   - validate that loop is not `kqueue` based
@@ -347,7 +347,9 @@ def p_string(bs):
 def coro(fn):
     """Create lite double barrel contiuation from generator
 
-    - generator must yield continuation `ContT r a = ((a -> r), (e -> r)) -> r`
+    - continuation type is `ContT r a = ((a -> r), (e -> r)) -> r`
+    - fn must be a generator yielding continuation
+    - coro(fn) will return continuation
     """
     def coro_fn(*args, **kwargs):
         def cont_fn(on_done, on_error):
@@ -623,7 +625,12 @@ def fuzzy_scorer(niddle, haystack):
     return _fuzzy_scorer(niddle, haystack)
 
 
-RankResult = namedtuple('RankResult', ('score', 'index', 'haystack', 'positions'))
+RankResult = namedtuple('RankResult', (
+    'score',
+    'index',
+    'haystack',
+    'positions',
+))
 
 
 def _rank_task(scorer, niddle, haystack, offset):
@@ -1625,13 +1632,8 @@ def main() -> None:
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
-    def subpaths(root):
-        for path, subdir, files in os.walk(root):
-            for file in files:
-                yield os.path.join(path, file)
-    items = list(subpaths(os.path.expanduser('~/.config/configs')))
-
     try:
+        items = [line.strip() for line in sys.stdin.readlines()]
         with ProcessPoolExecutor(max_workers=5) as executor:
             selected = loop.run_until_complete(selector(items, executor))
         if selected >= 0:

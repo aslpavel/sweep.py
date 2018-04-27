@@ -1409,16 +1409,13 @@ class ListWidget:
         if type == TTY_KEY:
             name, mode = attrs
             if name == 'up':
-                if self.cursor == 0:
-                    self.offset = max(0, self.offset - 1)
-                else:
-                    self.cursor -= 1
+                self.move(-1)
+            elif name == 'pageup':
+                self.move(-self.height)
             elif name == 'down':
-                if self.offset + self.cursor + 1 < len(self.items):
-                    if self.cursor + 1 < self.height:
-                        self.cursor += 1
-                    else:
-                        self.offset += 1
+                self.move(1)
+            elif name == 'pagedown':
+                self.move(self.height)
 
     @property
     def selected(self):
@@ -1427,6 +1424,28 @@ class ListWidget:
             return self.items[current]
         else:
             return None
+
+    def move(self, count):
+        if count < 0:
+            count = -count
+            self.cursor -= count
+            if self.cursor < 0:
+                self.offset += self.cursor
+                self.cursor = 0
+                if self.offset < 0:
+                    self.offset = 0
+        else:
+            self.cursor += count
+            if self.offset + self.cursor < len(self.items):
+                if self.cursor >= self.height:
+                    self.offset += self.cursor - self.height + 1
+                    self.cursor = self.height - 1
+            else:
+                if self.cursor >= len(self.items):
+                    self.offset, self.cursor = 0, len(self.items) - 1
+                else:
+                    self.cursor = self.height - 1
+                    self.offset = len(self.items) - self.cursor - 1
 
     def reset(self, items):
         self.cursor = 0
@@ -1490,7 +1509,9 @@ async def selector(
         stop = time.time()
         input.set_suffix(
             Text(' \ue0b2').mark(face_prompt.invert()) +
-            Text(f' {len(result)}/{len(items)} {stop - start:.2f}s ').mark(face_prompt)
+            Text(
+                f' {len(result)}/{len(items)} {stop - start:.2f}s '
+            ).mark(face_prompt)
         )
         table.reset(result)
         render()

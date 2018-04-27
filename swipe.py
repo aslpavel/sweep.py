@@ -4,7 +4,6 @@
 TODO:
   - validate that loop is not `kqueue` based
   - use lighter queues?
-  - bottom of the screen rendering
   - disable signals
   - unittests
   - add types

@@ -2,6 +2,8 @@
 """Sweep is a command line fuzzy finer (fzf analog)
 
 TODO:
+  - use something instead of future in closer coro as it fails to complete
+    if loop is not running
   - validate that loop is not `kqueue` based
   - use lighter queues?
   - disable signals
@@ -27,7 +29,8 @@ import tty
 import warnings
 from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
-from functools import (partial, reduce)
+from contextlib import ExitStack
+from functools import partial, reduce
 
 from typing import (
     Generator,
@@ -865,7 +868,7 @@ class TTY:
             termios.ECHO,
             termios.ICANON,
             termios.IEXTEN,
-            # termios.ISIG,
+            termios.ISIG,
         ))
 
         try:
@@ -1424,6 +1427,11 @@ class ListWidget:
                 self.move(1)
             elif name == 'pagedown':
                 self.move(self.height)
+            elif mode & KEY_MODE_CTRL:
+                if name == 'p':
+                    self.move(-1)
+                elif name == 'n':
+                    self.move(1)
 
     @property
     def selected(self):
@@ -1506,25 +1514,29 @@ class ListWidget:
 
 async def selector(
     items,
-    executor,
     *,
+    prompt=None,
+    tty=None,
+    executor=None,
     loop=None,
     theme=None
 ):
     loop = loop or asyncio.get_event_loop()
+    prompt = prompt or 'input'
+
     face_prompt = get_face('prompt', theme)
     face_match = get_face('match', theme)
-
-    ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
-    ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
     def render_item(tty, width, face, item):
         text = Text(item.haystack)
         text.mark_mask(face_match, item.positions)[:width].render(tty, face)
 
-    prompt = Text(' input ').mark(face_prompt) + Text('\ue0b0 ').mark(face_prompt.invert())
+    prefix = reduce(op.add, (
+        Text(f' {prompt} ').mark(face_prompt),
+        Text('\ue0b0 ').mark(face_prompt.invert()),
+    ))
     input = InputWidget()
-    input.set_prefix(prompt)
+    input.set_prefix(prefix)
     table = ListWidget([], render_item, 10, theme)
 
     async def table_update_coro(niddle):
@@ -1559,24 +1571,25 @@ async def selector(
     def render():
         tty.cursor_to(line, column)
         tty.erase_down()
-        # render label with pressed key
-        tty.write(f'{event}')
-        tty.erase_line()
         # show table
-        tty.cursor_to(line + 2, column)
+        tty.cursor_to(line + 1, column)
         table.render(tty)
         # show input
-        tty.cursor_to(line + 1, column)
+        tty.cursor_to(line, column)
         input.render(tty)
         # flush output
         tty.flush()
 
-    with TTY(loop=loop) as tty:
+    with ExitStack() as stack:
+        tty = tty or stack.enter_context(TTY(loop=loop))
+        executor = executor or stack.enter_context(
+            ProcessPoolExecutor(max_workers=5))
+
         tty.autowrap_set(False)
 
-        height = table.height + 1
-        tty.write('\n' * height)
-        tty.cursor_up(height)
+        # reserve space (force scroll)
+        tty.write('\n' * table.height)
+        tty.cursor_up(table.height)
         tty.flush()
 
         line, column = await tty.cursor_cpr()
@@ -1584,12 +1597,15 @@ async def selector(
 
         result = -1
         async for event in tty:
-            if event == ctrl_d:
-                break
-            elif event == ctrl_m:
-                selected = table.selected
-                result = -1 if selected is None else selected.index
-                break
+            type, attrs = event
+            if type == TTY_KEY:
+                name, mode = attrs
+                if name in 'cd':
+                    break
+                if name == 'm':
+                    selected = table.selected
+                    result = -1 if selected is None else selected.index
+                    break
             input(event)
             table(event)
             render()
@@ -1612,13 +1628,24 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '-p', '--prompt',
-        help='prompt label',
-    )
-    parser.add_argument(
         '-d', '--debug',
         action='store_true',
         help='enable debugging',
+    )
+    parser.add_argument(
+        '-r', '--reversed',
+        action='store_true',
+        help='reverse order of items',
+    )
+    parser.add_argument(
+        '-k', '--show-key',
+        action='store_true',
+        help='show last pressed key',
+    )
+    parser.add_argument(
+        '-p', '--prompt',
+        default='input',
+        help='override prompt string',
     )
     options = parser.parse_args()
 
@@ -1632,10 +1659,31 @@ def main() -> None:
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
+    items = [line.rstrip('\n') for line in sys.stdin.readlines()]
+    if options.reversed:
+        items = items[::-1]
     try:
-        items = [line.strip() for line in sys.stdin.readlines()]
-        with ProcessPoolExecutor(max_workers=5) as executor:
-            selected = loop.run_until_complete(selector(items, executor))
+        with ExitStack() as stack:
+            tty = stack.enter_context(TTY(loop=loop))
+            executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
+
+            if options.show_key:
+                def show_key(event):
+                    key = Text(str(event)).mark(face_key)
+                    tty.cursor_to(0, 0)
+                    key.render(tty)
+                    tty.erase_line()
+                    return True
+                face_key = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
+                tty.events.on(show_key)
+
+            selected = loop.run_until_complete(selector(
+                items,
+                prompt=options.prompt,
+                loop=loop,
+                tty=tty,
+                executor=executor,
+            ))
         if selected >= 0:
             print(items[selected])
     finally:

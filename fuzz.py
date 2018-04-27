@@ -4,9 +4,9 @@
 TODO:
   - validate that loop is not `kqueue` based
   - use lighter queues?
+  - bottom of the screen rendering
   - disable signals
   - unittests
-  - lighter Text format
   - add types
 """
 import array
@@ -556,8 +556,8 @@ def _fuzzy_scorer():
             True
         offset = 0
         for char in niddle:
-            offset = haystack.find(char, offset)
-            if offset < 0:
+            offset = haystack.find(char, offset) + 1
+            if offset <= 0:
                 return False
         return True
 
@@ -804,6 +804,9 @@ class TTYParser:
         return keys
 
 
+TTYSize = namedtuple('TTYSize', ('height', 'width'))
+
+
 class TTY:
     __slots__ = (
         'fd', 'size', 'events', 'events_queue', 'loop', 'closed',
@@ -819,13 +822,14 @@ class TTY:
         assert os.isatty(self.fd), f'file must be a tty: {file}'
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
-        self.events = Event()
+        self.size = TTYSize(0, 0)
 
         def events_queue_handler(event):
             type, _ = event
             if type != TTY_CPR:
                 self.events_queue.put_nowait(event)
             return True  # keep subscribed
+        self.events = Event()
         self.events_queue = asyncio.Queue()
         self.events.on(events_queue_handler)
 
@@ -866,9 +870,9 @@ class TTY:
             def resize_handler():
                 buf = array.array('H', (0, 0, 0, 0))
                 if fcntl.ioctl(self.fileno(), termios.TIOCGWINSZ, buf):
-                    size = (0, 0)
+                    size = TTYSize(0, 0)
                 else:
-                    size = (buf[0], buf[1])
+                    size = TTYSize(buf[0], buf[1])
                 self.size = size
                 self.events(TTYEvent(TTY_SIZE, size))
             resize_handler()
@@ -912,6 +916,15 @@ class TTY:
                 self.events(event)
         return True  # keep subscrbied
 
+    def write_sync(self, data: bytes) -> bool:
+        blocked = False
+        while data:
+            try:
+                data = data[os.write(self.fd, data):]
+            except BlockingIOError:
+                blocked = True
+        return blocked
+
     def write(self, input: str) -> None:
         self.write_buffer.write(input)
 
@@ -930,24 +943,20 @@ class TTY:
             partial(self.loop.remove_writer, self.fd),
         )
         encode = codecs.getencoder('utf-8')
-        frame = b''
         while True:
-            if not frame:
+            if not self.write_queue:
+                yield wait_queue
+                continue
+            frame, _ = encode(self.write_queue.popleft())
+            if self.write_sync(frame):
+                # we were blocked during writing previous frame
+                yield wait_writable
                 if self.write_queue:
-                    frame, _ = encode(self.write_queue.popleft())
-                else:
-                    yield wait_queue
-            else:
-                try:
-                    frame = frame[os.write(self.fd, frame):]
-                except BlockingIOError:
-                    yield wait_writable
-                    if self.write_queue:
-                        # removing all but last frame, assuming flush is called
-                        # on whole frame barrier.
-                        frame_last = self.write_queue.pop()
-                        self.write_queue.clear()
-                        self.write_queue.append(frame_last)
+                    # removing all but last frame, assuming flush is called
+                    # on whole frame barrier.
+                    frame_last = self.write_queue.pop()
+                    self.write_queue.clear()
+                    self.write_queue.append(frame_last)
 
     def __enter__(self):
         return self
@@ -1004,7 +1013,7 @@ class TTY:
         elif count == 1:
             self.write('\x1b[B')
         elif count > 1:
-            self.write('\x1b[{count}B')
+            self.write(f'\x1b[{count}B')
         else:
             self.cursor_up(-count)
 
@@ -1012,7 +1021,7 @@ class TTY:
         if index == 0:
             self.write('\x1b[G')
         elif index > 1:
-            self.write('\x1b[{index}G')
+            self.write(f'\x1b[{index}G')
         else:
             raise ValueError(f'column index can not be negative: {index}')
 
@@ -1047,14 +1056,7 @@ class TTY:
         cpr = self.loop.create_future()
         self.events.on(cpr_handler)
 
-        # doing direct write as frame might be dropped by writer
-        request = b'\x1b[6n'
-        while request:
-            try:
-                request = request[os.write(self.fd, b'\x1b[6n'):]
-            except BlockingIOError:
-                pass
-
+        self.write_sync(b'\x1b[6n')
         return await cpr
 
     def cursor_hide(self):
@@ -1147,9 +1149,9 @@ FACE_MAP = (
     (FACE_BLINK, '05;'),
     (FACE_REVERSE, '07;'),
 )
-
 FACE_RENDER_CACHE = {}
 FACE_OVERLAY_CACHE = {}
+
 
 class Face(tuple):
     __slots__ = tuple()
@@ -1182,7 +1184,7 @@ class Face(tuple):
         seq = FACE_RENDER_CACHE.get(self)
         if seq is None:
             fg, bg, attrs = self
-            buf = ['\x1b[']
+            buf = ['\x1b[m\x1b[']
             if attrs:
                 for attr, code in FACE_MAP:
                     if attrs & attr:
@@ -1204,99 +1206,111 @@ class Face(tuple):
         return f'Face({stream.getvalue()} X \x1b[m)'
 
 
-TEXT_STRING = 1
-TEXT_FACE = 2
-TEXT_LIST = 3
-
-
-class Text(tuple):
-    """Formated text
-
-    Text = TString String | TFace (Text, Face) | TList [Text]
+class Text:
+    """Formated text (string with associated faces)
     """
-    __slots__ = tuple()
+    __slots__ = ('_chunks', '_len',)
 
-    def __new__(cls, value, type=TEXT_STRING):
-        if type == TEXT_STRING:
-            return tuple.__new__(cls, (type, len(value), value))
-        elif type == TEXT_FACE:
-            text, _ = value
-            return tuple.__new__(cls, (type, len(text), value))
-        elif type == TEXT_LIST:
-            return tuple.__new__(
-                cls, (type, sum(len(text) for text in value), value))
-        assert False, 'unreachable'
+    def __init__(self, chunks):
+        if isinstance(chunks, str):
+            chunks = [(chunks, Face())]
+        self._chunks = chunks
+        self._len = None
 
     def __len__(self):
-        type, size, value = self
-        return size
+        if self._len is None:
+            self._len = sum(len(c) for c, _ in self._chunks)
+        return self._len
+
+    def __bool__(self):
+        return bool(self._chunks)
 
     def __add__(self, other):
-        if isinstance(other, str):
-            other = Text(other)
-        return Text((self, other), TEXT_LIST)
+        return Text(self._chunks + other._chunks)
+
+    def mark(self, face, start=None, stop=None):
+        start = 0 if start is None else (start if start >= 0 else len(self) + start)
+        stop = len(self) if stop is None else (stop if stop >= 0 else len(self) + stop)
+        left, mid = self.split(start)
+        mid, right = mid.split(stop - start)
+        chunks = []
+        chunks.extend(left._chunks)
+        for c_text, c_face in mid._chunks:
+            chunks.append((c_text, c_face.overlay(face)))
+        chunks.extend(right._chunks)
+        return Text(chunks)
+
+    def mark_mask(self, face, mask):
+        if not mask:
+            return self
+        # collect ranges
+        ranges = []
+        start, *mask = sorted(mask)
+        offset, stop = 0, start + 1
+        for index in mask:
+            if index == stop:
+                stop += 1
+            else:
+                ranges.append((start - offset, stop - start))
+                offset = stop
+                start, stop = index, index + 1
+        ranges.append((start - offset, stop - start))
+
+        chunks, text = [], self
+        for offset, size in ranges:
+            left, mid = text.split(offset)
+            mid, text = mid.split(size)
+            chunks.extend(left._chunks)
+            for c_text, c_face in mid._chunks:
+                chunks.append((c_text, c_face.overlay(face)))
+        chunks.extend(text._chunks)
+        return Text(chunks)
+
+    def split(self, index):
+        index = index if index >= 0 else len(self) + index
+        lefts, rights = [], []
+        for chunk_index, (text, face) in enumerate(self._chunks):
+            chunk_len = len(text)
+            if chunk_len < index:
+                index -= chunk_len
+                lefts.append((text, face))
+            elif chunk_len == index:
+                lefts.append((text, face))
+                rights.extend(self._chunks[chunk_index + 1:])
+                break
+            else:
+                left, right = text[:index], text[index:]
+                if left:
+                    lefts.append((left, face))
+                if right:
+                    rights.append((right, face))
+                rights.extend(self._chunks[chunk_index + 1:])
+                break
+        return Text(lefts), Text(rights)
 
     def __getitem__(self, selector):
         if isinstance(selector, slice):
-            assert slice.step is not None, 'slice step is not supported'
-            _, result = self.split(slice.start)
-            result, _ = result.split(slice.stop)
+            start, stop = selector.start, selector.stop
+            assert selector.step != 1, 'slice step is not supported'
+            start = 0 if start is None else (start if start >= 0 else len(self) + start)
+            stop = len(self) if stop is None else (stop if stop >= 0 else len(self) + stop)
+            _, result = self.split(start)
+            result, _ = result.split(stop - start)
             return result
         elif isinstance(selector, int):
             return self[selector:selector + 1]
         else:
             raise ValueError('text indices must be integers')
 
-    def mark(self, face, start=None, stop=None):
-        start = start or 0
-        stop = stop or len(self)
-        left, middle = self.split(start)
-        middle, right = middle.split(stop - start)
-        return Text((left, Text((middle, face), TEXT_FACE), right), TEXT_LIST)
-
-    def split(self, index):
-        type, size, value = self
-        index = index if index >= 0 else len(self) + index
-        if type == TEXT_STRING:
-            return Text(value[:index], type), Text(value[index:], type)
-        elif type == TEXT_FACE:
-            text, face = value
-            left, right = text.split(index)
-            return Text((left, face), type), Text((right, face), type)
-        elif type == TEXT_LIST:
-            lefts, rights = [], []
-            for i, t in enumerate(value):
-                lt = len(t)
-                if lt < index:
-                    index -= lt
-                    lefts.append(t)
-                elif lt == index:
-                    lefts.append(t)
-                    rights.extend(value[i + 1:])
-                    break
-                else:
-                    left, right = t.split(index)
-                    lefts.append(left)
-                    rights.append(right)
-                    rights.extend(value[i + 1:])
-                    break
-            return Text(lefts, TEXT_LIST), Text(rights, TEXT_LIST)
-
     def render(self, stream, face=Face()):
-        type, size, value = self
-        if type == TEXT_STRING:
-            stream.write(value)
-        elif type == TEXT_FACE:
-            f_text, f_face = value
-            f_face = face.overlay(f_face)
-            f_face.render(stream)
-            f_text.render(stream, f_face)
-            stream.write('\x1b[m')
-            face.render(stream)
-        elif type == TEXT_LIST:
-            for text in value:
-                text.render(stream, face)
-        return stream
+        p_face = face
+        for c_text, c_face in self._chunks:
+            c_face = face.overlay(c_face)
+            if c_face != p_face:
+                c_face.render(stream)
+                p_face = c_face
+            stream.write(c_text)
+        face.render(stream)
 
     def __str__(self):
         stream = io.StringIO()
@@ -1307,22 +1321,6 @@ class Text(tuple):
 
     def __repr__(self):
         return str(self)
-
-    def __bytes__(self):
-        stream = io.StringIO()
-        self.render(stream)
-        return stream.getvalue().encode()
-
-    def debug(self):
-        type, _, value = self
-        if type == TEXT_STRING:
-            return value
-        elif type == TEXT_FACE:
-            text, face = value
-            return (face, text.debug())
-        elif type == TEXT_LIST:
-            return tuple(t.debug() for t in value)
-        assert False, 'unreachable'
 
 
 # ------------------------------------------------------------------------------
@@ -1345,12 +1343,13 @@ def get_face(name, theme=None):
 
 
 class InputWidget:
-    __slots__ = ('prompt', 'buffer', 'cursor', 'update',)
+    __slots__ = ('buffer', 'cursor', 'update', 'prefix', 'suffix')
 
-    def __init__(self, prompt=None, buffer=None, cursor=None):
-        self.prompt = prompt or Text('')
+    def __init__(self, buffer=None, cursor=None):
         self.buffer = [] if buffer is None else list(buffer)
         self.cursor = len(self.buffer) if cursor is None else cursor
+        self.prefix = Text('')
+        self.suffix = Text('')
         self.update = Event()
 
     def __call__(self, event):
@@ -1379,11 +1378,20 @@ class InputWidget:
             self.update(self.buffer)
             self.cursor += 1
 
+    def set_prefix(self, prefix):
+        self.prefix = prefix
+
+    def set_suffix(self, suffix):
+        self.suffix = suffix
+
     def render(self, tty):
-        self.prompt.render(tty)
-        tty.write(''.join(self.buffer))
         tty.erase_line()
-        tty.cursor_backward(len(self.buffer) - self.cursor)
+        self.prefix.render(tty)
+        tty.write(''.join(self.buffer))
+        tty.cursor_to_column(tty.size.width - len(self.suffix) + 1)
+        self.suffix.render(tty)
+        tty.cursor_to_column(len(self.prefix) + self.cursor + 1)
+
 
 
 class ListWidget:
@@ -1429,6 +1437,7 @@ class ListWidget:
     def render(self, tty):
         start = self.offset
         stop = start + self.height
+        width = tty.size.width - 4
         for index in range(start, stop):
             if index == self.cursor + self.offset:
                 face = get_face('list_selected', self.theme)
@@ -1439,10 +1448,11 @@ class ListWidget:
                 face.render(tty)
                 tty.write('   ')
             if index < len(self.items):
-                self.render_item(tty, face, self.items[index])
+                self.render_item(tty, width, face, self.items[index])
             tty.erase_line()
             tty.cursor_to_column(0)
             tty.cursor_down(1)
+        tty.write('\x1b[m')
 
 
 async def selector(
@@ -1459,15 +1469,14 @@ async def selector(
     ctrl_d = TTYEvent(TTY_KEY, ('d', KEY_MODE_CTRL))
     ctrl_m = TTYEvent(TTY_KEY, ('m', KEY_MODE_CTRL))
 
-    def item_render(tty, face, item):
+    def render_item(tty, width, face, item):
         text = Text(item.haystack)
-        for position in item.positions:
-            text = text.mark(face_match, position, position + 1)
-        text.render(tty, face)
+        text.mark_mask(face_match, item.positions)[:width].render(tty, face)
 
     prompt = Text(' input ').mark(face_prompt) + Text('\ue0b0 ').mark(face_prompt.invert())
-    input = InputWidget(prompt)
-    table = ListWidget([], item_render, 10, theme)
+    input = InputWidget()
+    input.set_prefix(prompt)
+    table = ListWidget([], render_item, 10, theme)
 
     async def table_update_coro(niddle):
         niddle = ''.join(niddle)
@@ -1480,7 +1489,10 @@ async def selector(
             executor=executor,
         )
         stop = time.time()
-        label[1] = f'{len(result)}/{len(items)} {stop - start:.2f}s'
+        input.set_suffix(
+            Text(' \ue0b2').mark(face_prompt.invert()) +
+            Text(f' {len(result)}/{len(items)} {stop - start:.2f}s ').mark(face_prompt)
+        )
         table.reset(result)
         render()
 
@@ -1493,14 +1505,11 @@ async def selector(
     table_update_task = loop.create_future()
     input.update.on(table_update)
 
-    label = ['', '']
-
     def render():
         tty.cursor_to(line, column)
         tty.erase_down()
         # render label with pressed key
-        label[0] = f'{event}'
-        tty.write(' '.join(label))
+        tty.write(f'{event}')
         tty.erase_line()
         # show table
         tty.cursor_to(line + 2, column)
@@ -1514,9 +1523,10 @@ async def selector(
     with TTY(loop=loop) as tty:
         tty.autowrap_set(False)
 
-        height = table.height + 2
+        height = table.height + 1
         tty.write('\n' * height)
         tty.cursor_up(height)
+        tty.flush()
 
         line, column = await tty.cursor_cpr()
         table_update('')

@@ -1328,8 +1328,10 @@ class Text:
 THEME_DEFAULT = {
     'prompt': Face(bg=Color('#458588')),
     'match': Face(bg=Color('#d65d0e')),
-    'list_selected': Face(bg=Color('#3c3836')),
-    'list_default': Face(bg=Color('#282828')),
+    'list-selected': Face(bg=Color('#3c3836')),
+    'list-default': Face(bg=Color('#282828')),
+    'list-scrollbar-on': Face(bg=Color('#458588').with_alpha(.8)),
+    'list-scrollbar-off': Face(bg=Color('#458588').with_alpha(.4)),
 }
 
 
@@ -1392,7 +1394,6 @@ class InputWidget:
         tty.cursor_to_column(len(self.prefix) + self.cursor + 1)
 
 
-
 class ListWidget:
     __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor', 'theme',)
 
@@ -1453,21 +1454,44 @@ class ListWidget:
         self.items = items
 
     def render(self, tty):
-        start = self.offset
-        stop = start + self.height
-        width = tty.size.width - 4
-        for index in range(start, stop):
-            if index == self.cursor + self.offset:
-                face = get_face('list_selected', self.theme)
+        face_selected = get_face('list-selected', self.theme)
+        face_default = get_face('list-default', self.theme)
+        face_scrollbar_on = get_face('list-scrollbar-on', self.theme)
+        face_scrollbar_off = get_face('list-scrollbar-off', self.theme)
+
+        # scroll bar
+        scrollbar = [False] * self.height
+        if self.items:
+            filled = max(1, min(self.height, self.height ** 2 // len(self.items)))
+            empty = round((self.height - filled) * (self.offset + self.cursor) / len(self.items))
+            for fill in range(empty, empty + filled):
+                scrollbar[fill] = True
+
+        # lines
+        width = tty.size.width
+        for line in range(self.height):
+            # pointer
+            if line == self.cursor:
+                face = face_selected
                 face.render(tty)
                 tty.write(' \u25cf ')
             else:
-                face = get_face('list_default', self.theme)
+                face = face_default
                 face.render(tty)
                 tty.write('   ')
+            # text
+            index = self.offset + line
             if index < len(self.items):
-                self.render_item(tty, width, face, self.items[index])
-            tty.erase_line()
+                self.render_item(tty, width - 4, face, self.items[index])
+            tty.erase_line()  # will fill with current color
+            # scroll bar
+            tty.cursor_to_column(width)
+            if scrollbar[line]:
+                face.overlay(face_scrollbar_on).render(tty)
+            else:
+                face.overlay(face_scrollbar_off).render(tty)
+            tty.write(' ')
+            # next line
             tty.cursor_to_column(0)
             tty.cursor_down(1)
         tty.write('\x1b[m')

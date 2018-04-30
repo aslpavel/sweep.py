@@ -23,6 +23,7 @@ import signal
 import string
 import sys
 import termios
+import textwrap
 import time
 import traceback
 import tty
@@ -818,12 +819,13 @@ TTYSize = namedtuple('TTYSize', ('height', 'width'))
 
 class TTY:
     __slots__ = (
-        'fd', 'size', 'events', 'events_queue', 'loop', 'closed',
+        'fd', 'size', 'loop', 'closed', 'color_depth',
+        'events', 'events_queue',
         'write_queue', 'write_event', 'write_buffer',
     )
     DEFAULT_FILE = '/dev/tty'
 
-    def __init__(self, file: Union[int, str] = None, *, loop=None) -> None:
+    def __init__(self, *, file=None, loop=None, color_depth=None):
         if isinstance(file, int):
             self.fd = file
         else:
@@ -831,6 +833,7 @@ class TTY:
         assert os.isatty(self.fd), f'file must be a tty: {file}'
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
+        self.color_depth = color_depth
         self.size = TTYSize(0, 0)
 
         def events_queue_handler(event):
@@ -1084,6 +1087,11 @@ class TTY:
 # ------------------------------------------------------------------------------
 # Text
 # ------------------------------------------------------------------------------
+COLOR_DEPTH_24 = 1
+COLOR_DEPTH_8 = 2
+COLOR_DEPTH_4 = 3
+
+
 class Color(tuple):
     __slots__ = tuple()
     HEX_PATTERN = re.compile(
@@ -1141,8 +1149,75 @@ class Color(tuple):
         return Color((*self[:3], alpha))
 
     def __repr__(self):
-        return 'Color(\x1b[48;2;{};{};{}m  \x1b[m)'.format(
-            *(int(c * 255) for c in self[:3]))
+        return f'Color(\x1b[00{self.sgr(False)}m  \x1b[m)'
+
+    def sgr(self, is_fg, depth=None):
+        """Return part of SGR sequence responsible for picking this color
+        """
+        depth = depth or COLOR_DEPTH_24
+        r, g, b, _ = self
+
+        if depth == COLOR_DEPTH_24:
+            p = ';38' if is_fg else ';48'
+            return f'{p};2;{int(r * 255)};{int(g * 255)};{int(b * 255)}'
+
+        elif depth == COLOR_DEPTH_8:
+            def l2(lr, lg, lb, rr, rg, rb):
+                return (lr - rr) ** 2 + (lg - rg) ** 2 + (lb - rb) ** 2
+
+            # quantized color
+            def v2q(value):
+                if value < .1882:  # 48 / 255
+                    return 0
+                elif value < .4471:  # 114 / 255
+                    return 1
+                else:
+                    return int((value * 255.0 - 35.0) / 40.0)
+            # value range for color cupe [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff]
+            q2v = (0.0, 0.3725, 0.5294, 0.6863, 0.8431, 1.0)
+            qr, qg, qb = v2q(r), v2q(g), v2q(b)
+            cr, cg, cb = q2v[qr], q2v[qg], q2v[qb]
+
+            # grayscale color
+            c = (r + g + b) / 3
+            gi = 23 if c > .9333 else int((c * 255 - 3) / 10)
+            gv = (8 + 10 * gi) / 255.0
+
+            # determine if gray is closer then quantized color
+            if l2(cr, cg, cb, r, g, b) > l2(gv, gv, gv, r, g, b):
+                i = 232 + gi
+            else:
+                i = 16 + 36 * qr + 6 * qg + qb
+            p = ';38' if is_fg else ';48'
+            return f'{p};5;{i}'
+
+        elif depth == COLOR_DEPTH_4:
+            def l2(lr, lg, lb, rr, rg, rb):
+                return (lr - rr) ** 2 + (lg - rg) ** 2 + (lb - rb) ** 2
+
+            best_fg, best_bg, min_d = None, None, 4
+            for fg, bg, cr, cg, cb in (
+                (';30', ';40', 0, 0, 0),
+                (';31', ';41', .5, 0, 0),
+                (';32', ';42', 0, .5, 0),
+                (';33', ';43', .5, .5, 0),
+                (';34', ';44', 0, 0, .5),
+                (';35', ';45', .5, 0, .5),
+                (';36', ';46', 0, .5, .5),
+                (';37', ';47', 0.75, 0.75, 0.75),
+                (';90', ';100', 0.5, 0.5, 0.5),
+                (';91', ';101', 1, 0, 0),
+                (';92', ';102', 0, 1, 0),
+                (';93', ';103', 1, 1, 0),
+                (';94', ';104', 0, 0, 1),
+                (';95', ';105', 1, 0, 1),
+                (';96', ';106', 0, 1, 1),
+                (';97', ';107', 1, 1, 1),
+            ):
+                d = l2(r, g, b, cr, cg, cb)
+                if d < min_d:
+                    best_fg, best_bg, min_d = fg, bg, d
+            return best_fg if is_fg else best_bg
 
 
 FACE_NONE = 0
@@ -1152,11 +1227,11 @@ FACE_UNDERLINE = 1 << 3
 FACE_BLINK = 1 << 4
 FACE_REVERSE = 1 << 5
 FACE_MAP = (
-    (FACE_BOLD, '01;'),
-    (FACE_ITALIC, '03;'),
-    (FACE_UNDERLINE, '04;'),
-    (FACE_BLINK, '05;'),
-    (FACE_REVERSE, '07;'),
+    (FACE_BOLD, ';01'),
+    (FACE_ITALIC, ';03'),
+    (FACE_UNDERLINE, ';04'),
+    (FACE_BLINK, ';05'),
+    (FACE_REVERSE, ';07'),
 )
 FACE_RENDER_CACHE = {}
 FACE_OVERLAY_CACHE = {}
@@ -1193,17 +1268,16 @@ class Face(tuple):
         seq = FACE_RENDER_CACHE.get(self)
         if seq is None:
             fg, bg, attrs = self
-            buf = ['\x1b[m\x1b[']
+            buf = ['\x1b[00']
             if attrs:
                 for attr, code in FACE_MAP:
                     if attrs & attr:
                         buf.append(code)
-            if fg:
-                buf.append('38;2;{};{};{};'.format(
-                    *(int(c * 255) for c in fg[:3])))
-            if bg:
-                buf.append('48;2;{};{};{};'.format(
-                    *(int(c * 255) for c in bg[:3])))
+            depth = getattr(stream, 'color_depth', None)
+            if fg is not None:
+                buf.append(fg.sgr(True, depth))
+            if bg is not None:
+                buf.append(bg.sgr(False, depth))
             buf.append('m')
             seq = ''.join(buf)
             FACE_RENDER_CACHE[self] = seq
@@ -1636,11 +1710,13 @@ def main() -> None:
     import argparse
     import logging
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=textwrap.dedent("""\
+    Sweep is a command line fuzzy finer (fzf analog)
+    """))
     parser.add_argument(
-        '-d', '--debug',
-        action='store_true',
-        help='enable debugging',
+        '-p', '--prompt',
+        default='input',
+        help='override prompt string',
     )
     parser.add_argument(
         '-r', '--reversed',
@@ -1648,16 +1724,27 @@ def main() -> None:
         help='reverse order of items',
     )
     parser.add_argument(
-        '-k', '--show-key',
+        '--color-depth',
+        default='24',
+        choices=('24', '8', '4'),
+        help='color depth',
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='enable debugging',
+    )
+    parser.add_argument(
+        '--show-key',
         action='store_true',
         help='show last pressed key',
     )
-    parser.add_argument(
-        '-p', '--prompt',
-        default='input',
-        help='override prompt string',
-    )
     options = parser.parse_args()
+    color_depth = {
+            '24': COLOR_DEPTH_24,
+            '8': COLOR_DEPTH_8,
+            '4': COLOR_DEPTH_4,
+    }[options.color_depth]
 
     if sys.platform in ('darwin',):
         # kqueue does not support devices
@@ -1674,8 +1761,8 @@ def main() -> None:
         items = items[::-1]
     try:
         with ExitStack() as stack:
-            tty = stack.enter_context(TTY(loop=loop))
             executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
+            tty = stack.enter_context(TTY(loop=loop, color_depth=color_depth))
 
             if options.show_key:
                 def show_key(event):

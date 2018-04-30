@@ -1669,7 +1669,7 @@ def main() -> None:
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
-    items = [line.rstrip('\n') for line in sys.stdin.readlines()]
+    items = [line.rstrip() for line in sys.stdin.readlines()]
     if options.reversed:
         items = items[::-1]
     try:

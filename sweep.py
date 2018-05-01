@@ -1058,6 +1058,8 @@ class TTY:
             self.cursor_forward(-count)
 
     async def cursor_cpr(self):
+        """Current cursor possition
+        """
         def cpr_handler(event):
             type, attrs = event
             if type != TTY_CPR:
@@ -1132,6 +1134,15 @@ class Color(tuple):
     luma = property(lambda self: sum(
         c * p for c, p in zip(self, (0.2126, 0.7152, 0.0722))))
 
+    def hex(self):
+        r, g, b, a = self
+        return '#{:02x}{:02x}{:02x}{}'.format(
+            int(r * 255),
+            int(g * 255),
+            int(b * 255),
+            f'{int(a * 255):02x}' if a != 1 else '',
+        )
+
     def overlay(self, other):
         """Overlay other color over current color
         """
@@ -1149,7 +1160,8 @@ class Color(tuple):
         return Color((*self[:3], alpha))
 
     def __repr__(self):
-        return f'Color(\x1b[00{self.sgr(False)}m  \x1b[m)'
+        fg = ';38;5;231' if self.luma < .5 else ';38;5;232'
+        return f'Color(\x1b[00{fg}{self.sgr(False)}m{self.hex()}\x1b[m)'
 
     def sgr(self, is_fg, depth=None):
         """Return part of SGR sequence responsible for picking this color
@@ -1268,7 +1280,7 @@ class Face(tuple):
         seq = FACE_RENDER_CACHE.get(self)
         if seq is None:
             fg, bg, attrs = self
-            buf = ['\x1b[00']
+            buf = ['\x1b[00']  # first reset previous SGR settings
             if attrs:
                 for attr, code in FACE_MAP:
                     if attrs & attr:
@@ -1407,30 +1419,31 @@ class Text:
 
 
 # ------------------------------------------------------------------------------
-# Selector
-# -----------------------------------------------------------------------------
-COLOR_BASE = Color('#458588')
-COLOR_BG = Color('#32302f')
-COLOR_FG = Color('#ebdbb2')
-THEME_DEFAULT = {
-    'base-bg': Face(fg=COLOR_FG, bg=COLOR_BASE),
-    'base-fg': Face(fg=COLOR_BASE, bg=COLOR_BG),
-    'match': Face(fg=COLOR_FG, bg=Color('#d65d0e')),
-    'input-default': Face(fg=COLOR_FG, bg=COLOR_BG),
-    'list-dot': Face(fg=COLOR_BASE),
-    'list-selected': Face(fg=Color('#d5c4a1'), bg=Color('#3c3836')),
-    'list-default': Face(fg=Color('#d5c4a1'), bg=COLOR_BG),
-    'list-scrollbar-on': Face(bg=COLOR_BASE.with_alpha(.8)),
-    'list-scrollbar-off': Face(bg=COLOR_BASE.with_alpha(.4)),
-}
+# Widgets
+# ------------------------------------------------------------------------------
+def Theme(*, base=None, match=None, fg=None, bg=None):
+    base = Color(base or '#458588')
+    match = Color(match or '#d65d0e')
+    fg = Color(fg or '#ebdbb2')
+    bg = Color(bg or '#32302f')
+    theme_dict = {
+        'base_bg': Face(fg=fg, bg=base),
+        'base_fg': Face(fg=base, bg=bg),
+        'match': Face(fg=fg, bg=match, attrs=FACE_BOLD),
+        'input_default': Face(fg=fg, bg=bg),
+        'list_dot': Face(fg=base),
+        'list_selected': Face(
+            fg=bg.overlay(fg.with_alpha(.9)),
+            bg=bg.overlay(fg.with_alpha(.055)),
+        ),
+        'list_default': Face(fg=bg.overlay(fg.with_alpha(.9)), bg=bg),
+        'list_scrollbar_on': Face(bg=base.with_alpha(.8)),
+        'list_scrollbar_off': Face(bg=base.with_alpha(.4)),
+    }
+    return type('Theme', tuple(), theme_dict)()
 
 
-def get_face(name, theme=None):
-    """Get face with specified name from theme
-    """
-    if theme is None:
-        theme = THEME_DEFAULT
-    return theme.get(name) or THEME_DEFAULT[name]
+THEME_DEFAULT = Theme()
 
 
 class InputWidget:
@@ -1476,7 +1489,8 @@ class InputWidget:
         self.suffix = suffix
 
     def render(self, tty, theme=None):
-        get_face('input-default', theme).render(tty)
+        theme = theme or THEME_DEFAULT
+        theme.input_default.render(tty)
         tty.erase_line()
         self.prefix.render(tty)
         tty.write(''.join(self.buffer))
@@ -1549,11 +1563,12 @@ class ListWidget:
         self.items = items
 
     def render(self, tty, theme=None):
-        face_selected = get_face('list-selected', theme)
-        face_default = get_face('list-default', theme)
-        face_scrollbar_on = get_face('list-scrollbar-on', theme)
-        face_scrollbar_off = get_face('list-scrollbar-off', theme)
-        face_dot = get_face('list-dot')
+        theme = theme or THEME_DEFAULT
+        face_selected = theme.list_selected
+        face_default = theme.list_default
+        face_scrollbar_on = theme.list_scrollbar_on
+        face_scrollbar_off = theme.list_scrollbar_off
+        face_dot = theme.list_dot
 
         # scroll bar
         scrollbar = [False] * self.height
@@ -1593,23 +1608,29 @@ class ListWidget:
         tty.write('\x1b[m')
 
 
-async def selector(
-    items,
+# ------------------------------------------------------------------------------
+# Select
+# ------------------------------------------------------------------------------
+async def select(
+    candidates,
     *,
     height=None,
     prompt=None,
     tty=None,
     executor=None,
     loop=None,
-    theme=None
+    theme=None,
 ):
+    """Show text UI to select candidate
+    """
     prompt = prompt or 'input'
     height = height or 10
+    theme = theme or THEME_DEFAULT
     loop = loop or asyncio.get_event_loop()
 
-    face_base_fg = get_face('base-fg', theme)
-    face_base_bg = get_face('base-bg', theme)
-    face_match = get_face('match', theme)
+    face_base_fg = theme.base_fg
+    face_base_bg = theme.base_bg
+    face_match = theme.match
 
     def render_item(tty, width, face, item):
         text = Text(item.haystack)
@@ -1629,7 +1650,7 @@ async def selector(
         result = await rank(
             fuzzy_scorer,
             niddle,
-            items,
+            candidates,
             loop=loop,
             executor=executor,
         )
@@ -1637,7 +1658,7 @@ async def selector(
         input.set_suffix(
             Text(' \ue0b2').mark(face_base_fg) +
             Text(
-                f' {len(result)}/{len(items)} {stop - start:.2f}s '
+                f' {len(result)}/{len(candidates)} {stop - start:.2f}s '
             ).mark(face_base_bg)
         )
         table.reset(result)
@@ -1660,7 +1681,7 @@ async def selector(
         table.render(tty, theme)
         # show input
         tty.cursor_to(line, column)
-        input.render(tty)
+        input.render(tty, theme)
         # flush output
         tty.flush()
 
@@ -1724,6 +1745,14 @@ def main() -> None:
         help='reverse order of items',
     )
     parser.add_argument(
+        '-n', '--nth',
+        help='comma-separated list of for limiting search scope',
+    )
+    parser.add_argument(
+        '-d', '--delimiter',
+        help='field delimiter',
+    )
+    parser.add_argument(
         '--color-depth',
         default='24',
         choices=('24', '8', '4'),
@@ -1774,7 +1803,7 @@ def main() -> None:
                 face_key = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
                 tty.events.on(show_key)
 
-            selected = loop.run_until_complete(selector(
+            selected = loop.run_until_complete(select(
                 items,
                 prompt=options.prompt,
                 loop=loop,

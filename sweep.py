@@ -1433,11 +1433,11 @@ class Text:
 # ------------------------------------------------------------------------------
 # Widgets
 # ------------------------------------------------------------------------------
-def Theme(*, base=None, match=None, fg=None, bg=None):
-    base = Color(base or '#458588')
-    match = Color(match or '#d65d0e')
-    fg = Color(fg or '#ebdbb2')
-    bg = Color(bg or '#32302f')
+def Theme(base, match, fg, bg):
+    base = Color(base)
+    match = Color(match)
+    fg = Color(fg)
+    bg = Color(bg)
     theme_dict = {
         'base_bg': Face(bg=base).with_fg_contrast(fg, bg),
         'base_fg': Face(fg=base, bg=bg),
@@ -1868,7 +1868,7 @@ def main_options():
         return depth
 
     def parse_theme(argument):
-        attrs = {}
+        attrs = dict(THEME_DARK_ATTRS)
         for attr in argument.lower().split(','):
             if attr == 'light':
                 attrs.update(THEME_LIGHT_ATTRS)
@@ -1876,7 +1876,7 @@ def main_options():
                 attrs.update(THEME_DARK_ATTRS)
             else:
                 key, value = attr.split('=')
-                attrs[key] = value
+                attrs[key] = value.strip('"\'')
         return Theme(**attrs)
 
     parser = argparse.ArgumentParser(description=textwrap.dedent("""\
@@ -1907,7 +1907,7 @@ def main_options():
         '--theme',
         type=parse_theme,
         default=THEME_DEFAULT,
-        help='specify theme as list of comma sperated attributes',
+        help='specify theme as a list of comma sperated attributes',
     )
     parser.add_argument(
         '--color-depth',
@@ -1926,7 +1926,7 @@ def main_options():
 def main() -> None:
     options = main_options()
 
-    # `kqueue` does not support tty, fallback to `poll`
+    # `kqueue` does not support tty, fallback to `select`
     if sys.platform in ('darwin',):
         import selectors
         asyncio.set_event_loop(

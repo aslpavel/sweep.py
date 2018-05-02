@@ -6,7 +6,6 @@ TODO:
     if loop is not running
   - validate that loop is not `kqueue` based
   - use lighter queues?
-  - disable signals
   - unittests
   - add types
 """
@@ -23,7 +22,6 @@ import signal
 import string
 import sys
 import termios
-import textwrap
 import time
 import traceback
 import tty
@@ -34,11 +32,7 @@ from contextlib import ExitStack
 from functools import partial, reduce
 
 from typing import (
-    Generator,
     Iterable,
-    NamedTuple,
-    Tuple,
-    Union,
 )
 
 
@@ -640,7 +634,7 @@ RankResult = namedtuple('RankResult', (
 def _rank_task(scorer, niddle, haystack, offset):
     result = []
     for index, item in enumerate(haystack):
-        score, positions = scorer(niddle, item)
+        score, positions = scorer(niddle, str(item))
         if positions is None:
             continue
         result.append(RankResult(-score, index + offset, item, positions))
@@ -1383,6 +1377,16 @@ class Text:
                 break
         return Text(lefts), Text(rights)
 
+    def join(self, texts):
+        texts = list(texts)
+        chunks = []
+        index_last = len(texts) - 1
+        for index, text in enumerate(texts):
+            chunks.extend(text._chunks)
+            if index != index_last:
+                chunks.extend(self._chunks)
+        return Text(chunks)
+
     def __getitem__(self, selector):
         if isinstance(selector, slice):
             start, stop = selector.start, selector.stop
@@ -1439,6 +1443,8 @@ def Theme(*, base=None, match=None, fg=None, bg=None):
         'list_default': Face(fg=bg.overlay(fg.with_alpha(.9)), bg=bg),
         'list_scrollbar_on': Face(bg=base.with_alpha(.8)),
         'list_scrollbar_off': Face(bg=base.with_alpha(.4)),
+        'candidate_active': Face(fg=bg.overlay(fg.with_alpha(.9))),
+        'candidate_inactive': Face(fg=bg.overlay(fg.with_alpha(.4))),
     }
     return type('Theme', tuple(), theme_dict)()
 
@@ -1500,14 +1506,14 @@ class InputWidget:
 
 
 class ListWidget:
-    __slots__ = ('items', 'render_item', 'height', 'offset', 'cursor',)
+    __slots__ = ('items', 'height', 'offset', 'cursor', 'item_to_text',)
 
-    def __init__(self, items, render_item, height):
+    def __init__(self, items, height, item_to_text):
         self.items = items
         self.cursor = 0
         self.offset = 0
         self.height = height
-        self.render_item = render_item
+        self.item_to_text = item_to_text
 
     def __call__(self, event):
         type, attrs = event
@@ -1593,7 +1599,7 @@ class ListWidget:
             # text
             index = self.offset + line
             if index < len(self.items):
-                self.render_item(tty, width - 4, face, self.items[index])
+                self.item_to_text(self.items[index])[:width - 4].render(tty, face)
             tty.erase_line()  # will fill with current color
             # scroll bar
             tty.cursor_to_column(width)
@@ -1611,6 +1617,75 @@ class ListWidget:
 # ------------------------------------------------------------------------------
 # Select
 # ------------------------------------------------------------------------------
+class Candidate(tuple):
+    def __new__(cls, fields, positions=None):
+        return tuple.__new__(cls, (fields, positions))
+
+    @classmethod
+    def from_str(cls, string, delimiter=None, predicate=None):
+        if delimiter is None or predicate is None:
+            return cls(((string, True),))
+
+        offset, fields = 0, []
+        for match in re.finditer(delimiter, string):
+            if match.start() == 0:
+                continue
+            end = match.end()
+            fields.append(string[offset:end])
+            offset = end
+        if offset < len(string):
+            fields.append(string[offset:])
+
+        return cls(tuple((field, predicate(index))
+                         for index, field in enumerate(fields)))
+
+    def to_str(self):
+        fields, _ = self
+        return ''.join(field for field, _ in fields)
+
+    def to_text(self, theme=None):
+        fields, positions = self
+        theme = theme or THEME_DEFAULT
+
+        face_active = theme.candidate_active
+        face_inactive = theme.candidate_inactive
+
+        text = Text('').join(
+            Text(field).mark(face_active if active else face_inactive)
+            for field, active in fields
+        )
+        return text.mark_mask(theme.match, positions)
+
+    def with_positions(self, positions):
+        fields, _ = self
+
+        positions_rev = list(reversed(positions)) if positions else []
+        positions = []
+        offset, size = 0, 0
+        for field, active in fields:
+            if active:
+                size += len(field)
+                while positions_rev and positions_rev[-1] < size + offset:
+                    positions.append(positions_rev.pop() + offset)
+            else:
+                offset += len(field)
+        return Candidate(fields, positions)
+
+    def __str__(self):
+        """Used in ranker to produce candidate string
+        """
+        fields, _ = self
+        return ''.join(field for field, active in fields if active)
+
+    def __repr__(self):
+        stream = io.StringIO()
+        self.to_text().render(stream)
+        return f'Candidate(\'{stream.getvalue()}\')'
+
+    def __reduce__(self):
+        return Candidate, tuple(self)
+
+
 async def select(
     candidates,
     *,
@@ -1622,6 +1697,8 @@ async def select(
     theme=None,
 ):
     """Show text UI to select candidate
+
+    Candidates can be either strings or `Candidate` objects.
     """
     prompt = prompt or 'input'
     height = height or 10
@@ -1632,9 +1709,11 @@ async def select(
     face_base_bg = theme.base_bg
     face_match = theme.match
 
-    def render_item(tty, width, face, item):
-        text = Text(item.haystack)
-        text.mark_mask(face_match, item.positions)[:width].render(tty, face)
+    def item_to_text(item):
+        if isinstance(item.haystack, Candidate):
+            return item.haystack.with_positions(item.positions).to_text(theme)
+        else:
+            return Text(item.haystack).mark_mask(face_match, item.positions)
 
     prefix = reduce(op.add, (
         Text(f' {prompt} ').mark(face_base_bg),
@@ -1642,7 +1721,7 @@ async def select(
     ))
     input = InputWidget()
     input.set_prefix(prefix)
-    table = ListWidget([], render_item, height)
+    table = ListWidget([], height, item_to_text)
 
     async def table_update_coro(niddle):
         niddle = ''.join(niddle)
@@ -1727,9 +1806,53 @@ async def select(
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
-def main() -> None:
+def main_options():
     import argparse
-    import logging
+    import textwrap
+
+    def parse_nth(argument):
+        def predicate(low, high):
+            if low is not None and high is not None:
+                return lambda index: low <= index <= high
+            elif low is not None:
+                return lambda index: index >= low
+            elif high is not None:
+                return lambda index: index <= high
+            else:
+                return lambda _: True
+
+        def predicate_field(index):
+            return index in fields
+
+        fields = set()
+        predicates = [predicate_field]
+        for field in argument.split(','):
+            field = field.split('..')
+            if len(field) == 1:
+                fields.add(int(field[0]) - 1)
+            elif len(field) == 2:
+                low, high = field
+                predicates.append(predicate(
+                    int(low) - 1 if low else None,
+                    int(high) - 1 if high else None,
+                ))
+            else:
+                raise argparse.ArgumentTypeError(
+                    f'invalid predicate: {"..".join(fields)}')
+
+        return lambda index: any(predicate(index) for predicate in predicates)
+
+    def parse_color_depth(argument):
+        depths = {
+            '24': COLOR_DEPTH_24,
+            '8': COLOR_DEPTH_8,
+            '4': COLOR_DEPTH_4,
+        }
+        depth = depths.get(argument)
+        if depth is None:
+            raise argparse.ArgumentTypeError(
+                f'invalid depth: {argument} (allowed [{",".join(depths)}])')
+        return depth
 
     parser = argparse.ArgumentParser(description=textwrap.dedent("""\
     Sweep is a command line fuzzy finer (fzf analog)
@@ -1746,16 +1869,19 @@ def main() -> None:
     )
     parser.add_argument(
         '-n', '--nth',
+        type=parse_nth,
         help='comma-separated list of for limiting search scope',
     )
     parser.add_argument(
         '-d', '--delimiter',
-        help='field delimiter',
+        type=re.compile,
+        default=re.compile('[ \t]+'),
+        help='field delimiter regular expression',
     )
     parser.add_argument(
         '--color-depth',
-        default='24',
-        choices=('24', '8', '4'),
+        type=parse_color_depth,
+        default=COLOR_DEPTH_24,
         help='color depth',
     )
     parser.add_argument(
@@ -1768,30 +1894,36 @@ def main() -> None:
         action='store_true',
         help='show last pressed key',
     )
-    options = parser.parse_args()
-    color_depth = {
-            '24': COLOR_DEPTH_24,
-            '8': COLOR_DEPTH_8,
-            '4': COLOR_DEPTH_4,
-    }[options.color_depth]
+    return parser.parse_args()
 
+
+def main() -> None:
+    options = main_options()
+
+    # `kqueue` does not support tty, fallback to `select`
     if sys.platform in ('darwin',):
-        # kqueue does not support devices
         import selectors
         asyncio.set_event_loop(
             asyncio.SelectorEventLoop(selectors.SelectSelector()))
+
     loop = asyncio.get_event_loop()
     if options.debug:
+        import logging
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
-    items = [line.rstrip() for line in sys.stdin.readlines()]
+    candidates = [Candidate.from_str(
+        line.rstrip(),
+        delimiter=options.delimiter,
+        predicate=options.nth,
+    ) for line in sys.stdin.readlines()]
     if options.reversed:
-        items = items[::-1]
+        candidates = candidates[::-1]
+
     try:
         with ExitStack() as stack:
             executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
-            tty = stack.enter_context(TTY(loop=loop, color_depth=color_depth))
+            tty = stack.enter_context(TTY(loop=loop, color_depth=options.color_depth))
 
             if options.show_key:
                 def show_key(event):
@@ -1804,14 +1936,14 @@ def main() -> None:
                 tty.events.on(show_key)
 
             selected = loop.run_until_complete(select(
-                items,
+                candidates,
                 prompt=options.prompt,
                 loop=loop,
                 tty=tty,
                 executor=executor,
             ))
         if selected >= 0:
-            print(items[selected])
+            print(candidates[selected].to_str())
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()

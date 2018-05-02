@@ -815,7 +815,7 @@ class TTY:
     __slots__ = (
         'fd', 'size', 'loop', 'closed', 'color_depth',
         'events', 'events_queue',
-        'write_queue', 'write_event', 'write_buffer',
+        'write_queue', 'write_event', 'write_buffer', 'write_count',
     )
     DEFAULT_FILE = '/dev/tty'
 
@@ -842,6 +842,7 @@ class TTY:
         self.write_buffer = io.StringIO()
         self.write_event = Event()
         self.write_queue = deque()
+        self.write_count = 0
 
         self.closed = self.loop.create_future()
         cont_run(self._closer(), name='TTY._closer')
@@ -954,6 +955,7 @@ class TTY:
                 yield wait_queue
                 continue
             frame, _ = encode(self.write_queue.popleft())
+            self.write_count += 1
             if self.write_sync(frame):
                 # we were blocked during writing previous frame
                 yield wait_writable
@@ -1249,6 +1251,10 @@ class Face(tuple):
     def __new__(cls, fg=None, bg=None, attrs=FACE_NONE):
         return tuple.__new__(cls, (fg, bg, attrs))
 
+    fg = property(lambda self: self[0])
+    bg = property(lambda self: self[1])
+    attrs = property(lambda self: self[2])
+
     def overlay(self, other):
         face = FACE_OVERLAY_CACHE.get((self, other))
         if face is None:
@@ -1266,9 +1272,11 @@ class Face(tuple):
         fg, bg, attrs = self
         return Face(bg, fg, attrs)
 
-    fg = property(lambda self: self[0])
-    bg = property(lambda self: self[1])
-    attrs = property(lambda self: self[2])
+    def with_fg_contrast(self, fg0, fg1):
+        _, bg, attrs = self
+        fg_light, fg_dark = (fg0, fg1) if fg0.luma > fg1.luma else (fg1, fg0)
+        fg = bg.overlay(fg_light if bg.luma < .5 else fg_dark)
+        return Face(fg, bg, attrs)
 
     def render(self, stream):
         seq = FACE_RENDER_CACHE.get(self)
@@ -1431,9 +1439,9 @@ def Theme(*, base=None, match=None, fg=None, bg=None):
     fg = Color(fg or '#ebdbb2')
     bg = Color(bg or '#32302f')
     theme_dict = {
-        'base_bg': Face(fg=fg, bg=base),
+        'base_bg': Face(bg=base).with_fg_contrast(fg, bg),
         'base_fg': Face(fg=base, bg=bg),
-        'match': Face(fg=fg, bg=match, attrs=FACE_BOLD),
+        'match': Face(bg=match, attrs=FACE_BOLD).with_fg_contrast(fg, bg),
         'input_default': Face(fg=fg, bg=bg),
         'list_dot': Face(fg=base),
         'list_selected': Face(
@@ -1448,8 +1456,9 @@ def Theme(*, base=None, match=None, fg=None, bg=None):
     }
     return type('Theme', tuple(), theme_dict)()
 
-
-THEME_DEFAULT = Theme()
+THEME_LIGHT_ATTRS = dict(base='#076678', match='#af3a03', fg='#3c3836', bg='#fbf1c7')
+THEME_DARK_ATTRS = dict(base='#458588', match='#fe8019', fg='#ebdbb2', bg='#282828')
+THEME_DEFAULT = Theme(**THEME_DARK_ATTRS)
 
 
 class InputWidget:
@@ -1496,12 +1505,14 @@ class InputWidget:
 
     def render(self, tty, theme=None):
         theme = theme or THEME_DEFAULT
-        theme.input_default.render(tty)
+        face = theme.input_default
+        face.render(tty)
         tty.erase_line()
-        self.prefix.render(tty)
+        self.prefix.render(tty, face)
+        face.render(tty)
         tty.write(''.join(self.buffer))
         tty.cursor_to_column(tty.size.width - len(self.suffix) + 1)
-        self.suffix.render(tty)
+        self.suffix.render(tty, face)
         tty.cursor_to_column(len(self.prefix) + self.cursor + 1)
 
 
@@ -1754,6 +1765,7 @@ async def select(
 
     def render():
         tty.cursor_to(line, column)
+        tty.write('\x1b[00m')
         tty.erase_down()
         # show table
         tty.cursor_to(line + 1, column)
@@ -1795,6 +1807,7 @@ async def select(
             render()
 
         tty.cursor_to(line, column)
+        tty.write('\x1b[00m')
         tty.erase_down()
         tty.autowrap_set(True)
         tty.flush()
@@ -1854,6 +1867,18 @@ def main_options():
                 f'invalid depth: {argument} (allowed [{",".join(depths)}])')
         return depth
 
+    def parse_theme(argument):
+        attrs = {}
+        for attr in argument.lower().split(','):
+            if attr == 'light':
+                attrs.update(THEME_LIGHT_ATTRS)
+            elif attr == 'dark':
+                attrs.update(THEME_DARK_ATTRS)
+            else:
+                key, value = attr.split('=')
+                attrs[key] = value
+        return Theme(**attrs)
+
     parser = argparse.ArgumentParser(description=textwrap.dedent("""\
     Sweep is a command line fuzzy finer (fzf analog)
     """))
@@ -1879,6 +1904,12 @@ def main_options():
         help='field delimiter regular expression',
     )
     parser.add_argument(
+        '--theme',
+        type=parse_theme,
+        default=THEME_DEFAULT,
+        help='specify theme as list of comma sperated attributes',
+    )
+    parser.add_argument(
         '--color-depth',
         type=parse_color_depth,
         default=COLOR_DEPTH_24,
@@ -1889,18 +1920,13 @@ def main_options():
         action='store_true',
         help='enable debugging',
     )
-    parser.add_argument(
-        '--show-key',
-        action='store_true',
-        help='show last pressed key',
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     options = main_options()
 
-    # `kqueue` does not support tty, fallback to `select`
+    # `kqueue` does not support tty, fallback to `poll`
     if sys.platform in ('darwin',):
         import selectors
         asyncio.set_event_loop(
@@ -1925,15 +1951,20 @@ def main() -> None:
             executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
             tty = stack.enter_context(TTY(loop=loop, color_depth=options.color_depth))
 
-            if options.show_key:
-                def show_key(event):
-                    key = Text(str(event)).mark(face_key)
+            if options.debug:
+                def debug_label(event):
+                    label = ' '.join((
+                        '',
+                        f'event: {event}',
+                        f'write_count: {tty.write_count}',
+                        '',
+                    ))
                     tty.cursor_to(0, 0)
-                    key.render(tty)
+                    Text(label).mark(face_key).render(tty)
                     tty.erase_line()
                     return True
                 face_key = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
-                tty.events.on(show_key)
+                tty.events.on(debug_label)
 
             selected = loop.run_until_complete(select(
                 candidates,
@@ -1941,6 +1972,7 @@ def main() -> None:
                 loop=loop,
                 tty=tty,
                 executor=executor,
+                theme=options.theme,
             ))
         if selected >= 0:
             print(candidates[selected].to_str())

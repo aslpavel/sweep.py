@@ -568,7 +568,7 @@ def _fuzzy_scorer():
         niddle, haystack = niddle.lower(), haystack.lower()
 
         if n == 0 or n == m:
-            return SCORE_MAX, []
+            return SCORE_MAX, list(range(n))
         D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
         M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
         for i in range(n):

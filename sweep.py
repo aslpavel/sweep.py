@@ -775,7 +775,7 @@ def p_tty():
     # chars
     add(p_utf8, lambda buf: TTYEvent(TTY_CHAR, buf.decode()))
 
-    return Pattern.choice(patterns).optimize()
+    return Pattern.choice(patterns)
 
 
 class TTYParser:

@@ -1441,7 +1441,7 @@ def Theme(base, match, fg, bg):
     theme_dict = {
         'base_bg': Face(bg=base).with_fg_contrast(fg, bg),
         'base_fg': Face(fg=base, bg=bg),
-        'match': Face(bg=match, attrs=FACE_BOLD).with_fg_contrast(fg, bg),
+        'match': Face(bg=match).with_fg_contrast(fg, bg),
         'input_default': Face(fg=fg, bg=bg),
         'list_dot': Face(fg=base),
         'list_selected': Face(

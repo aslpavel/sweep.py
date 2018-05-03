@@ -1558,32 +1558,28 @@ class ListWidget:
     @property
     def selected(self):
         current = self.offset + self.cursor
-        if current < len(self.items):
+        if 0 <= current < len(self.items):
             return self.items[current]
         else:
             return None
 
     def move(self, count):
-        if count < 0:
-            count = -count
-            self.cursor -= count
-            if self.cursor < 0:
-                self.offset += self.cursor
-                self.cursor = 0
-                if self.offset < 0:
-                    self.offset = 0
+        self.cursor += count
+        if self.cursor < 0:
+            self.offset += self.cursor
+            self.cursor = 0
+            if self.offset < 0:
+                self.offset = 0
+        elif self.offset + self.cursor < len(self.items):
+            if self.cursor >= self.height:
+                self.offset += self.cursor - self.height + 1
+                self.cursor = self.height - 1
         else:
-            self.cursor += count
-            if self.offset + self.cursor < len(self.items):
-                if self.cursor >= self.height:
-                    self.offset += self.cursor - self.height + 1
-                    self.cursor = self.height - 1
+            if self.cursor >= len(self.items):
+                self.offset, self.cursor = 0, len(self.items) - 1
             else:
-                if self.cursor >= len(self.items):
-                    self.offset, self.cursor = 0, len(self.items) - 1
-                else:
-                    self.cursor = self.height - 1
-                    self.offset = len(self.items) - self.cursor - 1
+                self.cursor = self.height - 1
+                self.offset = len(self.items) - self.cursor - 1
 
     def reset(self, items):
         self.cursor = 0
@@ -1612,7 +1608,7 @@ class ListWidget:
         width = tty.size.width
         for line in range(self.height):
             # pointer
-            if line == self.cursor:
+            if self.items and line == self.cursor:
                 face = face_selected
                 face.render(tty)
                 Text(' \u25cf ').mark(face_dot).render(tty, face)
@@ -1622,7 +1618,7 @@ class ListWidget:
                 tty.write('   ')
             # text
             index = self.offset + line
-            if index < len(self.items):
+            if 0 <= index < len(self.items):
                 (self
                  .item_to_text(self.items[index])[:width - 4]
                  .render(tty, face))

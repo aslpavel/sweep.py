@@ -141,7 +141,11 @@ class Pattern:
         assert len(patterns) > 0, 'pattern set must be non empyt'
         table, starts, finals, epsilons = cls._merge(patterns, table=[{}])
         epsilons[0] = set(starts)
-        return Pattern(table, {f: cb for fs in finals for f, cb in fs.items()}, epsilons)
+        return Pattern(
+            table,
+            {f: cb for fs in finals for f, cb in fs.items()},
+            epsilons,
+        )
 
     def __or__(self, other):
         return self.choice((self, other))
@@ -205,7 +209,7 @@ class Pattern:
         #  - `n_` contains NFA states (indices in table)
         #  - `d_` constains DFA state (subset of all indices in table)
         def epsilon_closure(n_states):
-            """Epsilon closure (all state reachable with epsilon move) of set of states
+            """Epsilon closure (reachable with epsilon move) of set of states
             """
             d_state = set()
             queue = set(n_states)
@@ -231,7 +235,9 @@ class Pattern:
             # finals
             for n_state in d_state:
                 if n_state in self.finals:
-                    d_finals.setdefault(d_state, []).append(self.finals[n_state])
+                    (d_finals
+                     .setdefault(d_state, [])
+                     .append(self.finals[n_state]))
             # transitions
             n_trans = [self.table[n_state] for n_state in d_state]
             d_tran = {}
@@ -799,8 +805,8 @@ class TTYParser:
                         chunk = unconsumed
                         break
                     else:
-                        sys.stderr.write(
-                            f'[ERROR] failed to process: {bytes(unconsumed)}\n')
+                        sys.stderr.write('[ERROR] failed to process: {}\n'
+                                         .format(bytes(unconsumed)))
                         self._parse(None)
             else:
                 # all consumed (no break in for loop)
@@ -1326,8 +1332,10 @@ class Text:
         return Text(self._chunks + other._chunks)
 
     def mark(self, face, start=None, stop=None):
-        start = 0 if start is None else (start if start >= 0 else len(self) + start)
-        stop = len(self) if stop is None else (stop if stop >= 0 else len(self) + stop)
+        start = 0 if start is None else (
+            start if start >= 0 else len(self) + start)
+        stop = len(self) if stop is None else (
+            stop if stop >= 0 else len(self) + stop)
         left, mid = self.split(start)
         mid, right = mid.split(stop - start)
         chunks = []
@@ -1399,8 +1407,10 @@ class Text:
         if isinstance(selector, slice):
             start, stop = selector.start, selector.stop
             assert selector.step != 1, 'slice step is not supported'
-            start = 0 if start is None else (start if start >= 0 else len(self) + start)
-            stop = len(self) if stop is None else (stop if stop >= 0 else len(self) + stop)
+            start = 0 if start is None else (
+                start if start >= 0 else len(self) + start)
+            stop = len(self) if stop is None else (
+                stop if stop >= 0 else len(self) + stop)
             _, result = self.split(start)
             result, _ = result.split(stop - start)
             return result
@@ -1456,8 +1466,11 @@ def Theme(base, match, fg, bg):
     }
     return type('Theme', tuple(), theme_dict)()
 
-THEME_LIGHT_ATTRS = dict(base='#076678', match='#af3a03', fg='#3c3836', bg='#fbf1c7')
-THEME_DARK_ATTRS = dict(base='#458588', match='#fe8019', fg='#ebdbb2', bg='#282828')
+
+THEME_LIGHT_ATTRS = dict(
+    base='#076678', match='#af3a03', fg='#3c3836', bg='#fbf1c7')
+THEME_DARK_ATTRS = dict(
+    base='#458588', match='#fe8019', fg='#ebdbb2', bg='#282828')
 THEME_DEFAULT = Theme(**THEME_DARK_ATTRS)
 
 
@@ -1590,8 +1603,10 @@ class ListWidget:
         # scroll bar
         scrollbar = [False] * self.height
         if self.items:
-            filled = max(1, min(self.height, self.height ** 2 // len(self.items)))
-            empty = round((self.height - filled) * (self.offset + self.cursor) / len(self.items))
+            items_len = len(self.items)
+            filled = max(1, min(self.height, self.height ** 2 // items_len))
+            empty = round((self.height - filled) * (self.offset + self.cursor)
+                          / items_len)
             for fill in range(empty, empty + filled):
                 scrollbar[fill] = True
 
@@ -1610,7 +1625,9 @@ class ListWidget:
             # text
             index = self.offset + line
             if index < len(self.items):
-                self.item_to_text(self.items[index])[:width - 4].render(tty, face)
+                (self
+                 .item_to_text(self.items[index])[:width - 4]
+                 .render(tty, face))
             tty.erase_line()  # will fill with current color
             # scroll bar
             tty.cursor_to_column(width)
@@ -1949,7 +1966,10 @@ def main() -> None:
     try:
         with ExitStack() as stack:
             executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
-            tty = stack.enter_context(TTY(loop=loop, color_depth=options.color_depth))
+            tty = stack.enter_context(TTY(
+                loop=loop,
+                color_depth=options.color_depth,
+            ))
 
             if options.debug:
                 def debug_label(event):

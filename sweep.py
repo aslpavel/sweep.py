@@ -1443,13 +1443,13 @@ class Text:
 # ------------------------------------------------------------------------------
 def Theme(base, match, fg, bg):
     base = Color(base)
-    match = Color(match)
+    match = base.with_alpha(.5) if match is None else Color(match)
     fg = Color(fg)
     bg = Color(bg)
     theme_dict = {
         'base_bg': Face(bg=base).with_fg_contrast(fg, bg),
         'base_fg': Face(fg=base, bg=bg),
-        'match': Face(bg=match).with_fg_contrast(fg, bg),
+        'match': Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
         'input_default': Face(fg=fg, bg=bg),
         'list_dot': Face(fg=base),
         'list_selected': Face(
@@ -1466,9 +1466,9 @@ def Theme(base, match, fg, bg):
 
 
 THEME_LIGHT_ATTRS = dict(
-    base='#076678', match='#af3a03', fg='#3c3836', bg='#fbf1c7')
+    base='#8f3f71', match=None, fg='#3c3836', bg='#fbf1c7')
 THEME_DARK_ATTRS = dict(
-    base='#458588', match='#fe8019', fg='#ebdbb2', bg='#282828')
+    base='#d3869b', match=None, fg='#ebdbb2', bg='#282828')
 THEME_DEFAULT = Theme(**THEME_DARK_ATTRS)
 
 
@@ -1807,7 +1807,7 @@ async def select(
             type, attrs = event
             if type == TTY_KEY:
                 name, mode = attrs
-                if name in 'cd':
+                if name in 'cg':
                     break
                 if name == 'm':
                     selected = table.selected
@@ -1887,7 +1887,11 @@ def main_options():
                 attrs.update(THEME_DARK_ATTRS)
             else:
                 key, value = attr.split('=')
-                attrs[key] = value.strip('"\'')
+                value = value.strip('"\'')
+                if not value or value == 'none':
+                    attrs[key] = None
+                else:
+                    attrs[key] = value
         return Theme(**attrs)
 
     parser = argparse.ArgumentParser(description=textwrap.dedent("""\

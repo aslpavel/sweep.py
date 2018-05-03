@@ -892,10 +892,8 @@ class TTY:
             self.loop.add_signal_handler(signal.SIGWINCH, resize_handler)
 
             # reader
-            readable = Event()
             parser = TTYParser()
-            self.loop.add_reader(self.fd, lambda: readable(None))
-            readable.on(partial(self._try_read, parser))
+            self.loop.add_reader(self.fd, partial(self._try_read, parser))
 
             # writer
             cont_run(self._writer(), name='TTY._writer')
@@ -916,7 +914,7 @@ class TTY:
             self.loop.remove_writer(self.fd)
             os.close(self.fd)
 
-    def _try_read(self, parser, _):
+    def _try_read(self, parser):
         try:
             chunk = os.read(self.fd, 1024)
             if not chunk:

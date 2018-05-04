@@ -818,6 +818,11 @@ TTYSize = namedtuple('TTYSize', ('height', 'width'))
 
 
 class TTY:
+    """Asynchronous tty device
+
+    Ansi escape sequences:
+      - http://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+    """
     __slots__ = (
         'fd', 'size', 'loop', 'closed', 'color_depth',
         'events', 'events_queue',
@@ -1953,6 +1958,11 @@ def main() -> None:
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
+    # make stdin not fail on bad input
+    sys.stdin = codecs.getreader('utf-8')(
+        sys.stdin.detach(), errors='backslashreplace')
+
+    # generat candidates from stdin
     candidates = [Candidate.from_str(
         line.rstrip(),
         delimiter=options.delimiter,

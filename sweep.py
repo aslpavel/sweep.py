@@ -88,6 +88,20 @@ class Pattern:
         self.finals = finals
         self.epsilons = epsilons or {}
 
+    def check(self, string):
+        if not string:
+            return
+        if isinstance(string, str):
+            string = string.encode()
+        matcher = self()
+        matcher(None)
+        for i, c in enumerate(string):
+            alive, results, unconsumed = matcher(c)
+            if not alive:
+                break
+        unconsumed.extend(string[i + 1:])
+        return alive, results, unconsumed
+
     def __call__(self):
         pattern = self
         if self.epsilons:
@@ -114,6 +128,9 @@ class Pattern:
             fs = finals.get(state)
             if fs:
                 results.extend(f(buffer) for f in fs)
+                consumed = len(buffer)
+            elif fs is not None:
+                results.append(buffer)
                 consumed = len(buffer)
 
             return (
@@ -897,8 +914,8 @@ class TTY:
     )
     DEFAULT_FILE = '/dev/tty'
     EPILOGUE = (
-        # disable autowrap
-        b'\x1b[?7l'
+        # enable autowrap
+        b'\x1b[?7h'
         # disable mouse
         b'\x1b[?1003l'
         b'\x1b[?1006l'
@@ -1239,9 +1256,9 @@ class Color(tuple):
     def hex(self):
         r, g, b, a = self
         return '#{:02x}{:02x}{:02x}{}'.format(
-            int(r * 255),
-            int(g * 255),
-            int(b * 255),
+            round(r * 255),
+            round(g * 255),
+            round(b * 255),
             f'{int(a * 255):02x}' if a != 1 else '',
         )
 
@@ -1340,6 +1357,7 @@ FACE_ITALIC = 1 << 2
 FACE_UNDERLINE = 1 << 3
 FACE_BLINK = 1 << 4
 FACE_REVERSE = 1 << 5
+FACE_MASK = (1 << 6) - 1
 FACE_MAP = (
     (FACE_BOLD, ';01'),
     (FACE_ITALIC, ';03'),
@@ -1410,6 +1428,95 @@ class Face(tuple):
 
     def __repr__(self):
         return f'Face({str(self)} X \x1b[m)'
+
+    def with_sgr(self, params):
+        if not params:
+            return Face()
+        ansi_colors = (
+            (0, 0, 0),
+            (.5, 0, 0),
+            (0, .5, 0),
+            (.5, .5, 0),
+            (0, 0, .5),
+            (.5, 0, .5),
+            (0, .5, .5),
+            (0.75, 0.75, 0.75),
+            (0.5, 0.5, 0.5),
+            (1, 0, 0),
+            (0, 1, 0),
+            (1, 1, 0),
+            (0, 0, 1),
+            (1, 0, 1),
+            (0, 1, 1),
+            (1, 1, 1),
+        )
+        fg, bg, attrs = self
+        params = list(reversed(params))
+        while params:
+            param = params.pop()
+            if param == 1:
+                attrs |= FACE_BOLD
+            elif param == 3:
+                attrs |= FACE_ITALIC
+            elif param == 4:
+                attrs |= FACE_UNDERLINE
+            elif param == 5:
+                attrs |= FACE_BLINK
+            elif param == 7:
+                attrs |= FACE_REVERSE
+            elif 30 <= param <= 37:
+                fg = Color(ansi_colors[param - 30])
+            elif 40 <= param <= 47:
+                bg = Color(ansi_colors[param - 40])
+            elif 90 <= param <= 97:
+                fg = Color(ansi_colors[param - 82])
+            elif 100 <= param <= 107:
+                bg = Color(ansi_colors[param - 92])
+            elif param == 38 or param == 48:
+                if len(params) < 2:
+                    break
+                depth = params.pop()
+                if depth == 5:  # 256 colors
+                    n = params.pop()
+                    if n < 16:
+                        color = Color(ansi_colors[n])
+                    elif n <= 231:
+                        n -= 16
+                        qr, n = divmod(n, 36)
+                        qg, qb = divmod(n, 6)
+                        q2v = (0.0, 0.3725, 0.5294, 0.6863, 0.8431, 1.0)
+                        color = Color((q2v[qr], q2v[qg], q2v[qb]))
+                    elif n <= 255:
+                        v = (8 + 10 * (n - 232)) / 255.0
+                        color = Color((v, v, v))
+                elif depth == 2:  # true color
+                    if len(params) < 3:
+                        break
+                    color = Color(
+                        params.pop() / 255.0,
+                        params.pop() / 255.0,
+                        params.pop() / 255.0,
+                    )
+                if param == 38:
+                    fg = color
+                else:
+                    bg = color
+        return Face(fg, bg, attrs)
+
+
+@apply
+def p_ansi_text():
+    def extract_sgr(buf):
+        return (False, tuple(map(int, buf[2:-1].decode().split(';'))))
+    sgr = Pattern.sequence((
+        p_string('\x1b['),
+        p_number,
+        (p_string(';') + p_number).many(),
+        p_string('m'),
+    )).map(extract_sgr)
+    utf8 = p_utf8.map(lambda buf: (True, buf.decode()))
+    sgr_reset = p_string('\x1b[m').map(lambda _: (False, tuple()))
+    return (utf8 | sgr | sgr_reset).optimize()
 
 
 class Text:
@@ -1539,6 +1646,45 @@ class Text:
 
     def __repr__(self):
         return f'Text(\'{str(self)}\')'
+
+    @classmethod
+    def from_ansi(cls, input):
+        if isinstance(input, str):
+            input = input.encode()
+        parse = p_ansi_text()
+        parse(None)
+
+        chunks = []
+        chunk, face = io.StringIO(), Face()
+        while True:
+            for index, byte in enumerate(input):
+                alive, results, unconsumed = parse(byte)
+                if alive:
+                    continue
+                if results:
+                    is_char, value = results[-1]
+                    if is_char:
+                        chunk.write(value)
+                    else:
+                        if chunk.tell() != 0:
+                            chunks.append((chunk.getvalue(), face))
+                            chunk.seek(0)
+                            chunk.truncate()
+                        face = face.with_sgr(value)
+                    # reschedule unconsumed for parsing
+                    unconsumed.extend(input[index + 1:])
+                    input = unconsumed
+                    parse(None)
+                    break
+                else:
+                    sys.stderr.write('[ERROR] failed to process: {}\n'
+                                     .format(bytes(unconsumed)))
+                    parse(None)
+            else:
+                # all consumed (no break in for loop)
+                chunks.append((chunk.getvalue(), face))
+                break
+        return Text(chunks)
 
 
 # ------------------------------------------------------------------------------

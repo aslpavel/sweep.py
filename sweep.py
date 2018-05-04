@@ -677,11 +677,19 @@ TTY_CHAR = 1
 TTY_CPR = 2
 TTY_SIZE = 3
 TTY_CLOSE = 4
+TTY_MOUSE = 5
 
-KEY_MODE_ALT = 0b001
-KEY_MODE_CTRL = 0b010
-KEY_MODE_SHIFT = 0b100
-KEY_MODE_BITS = 3
+KEY_MODE_SHIFT = 0b001
+KEY_MODE_ALT = 0b010
+KEY_MODE_CTRL = 0b100
+KEY_MODE_PRESS = 0b1000
+KEY_MODE_BITS = 4
+
+KEY_MOUSE_LEFT = 1
+KEY_MOUSE_RIGHT = 2
+KEY_MOUSE_MIDDLE = 3
+KEY_MOUSE_WHEEL_UP = 4
+KEY_MOUSE_WHEEL_DOWN = 5
 
 
 class TTYEvent(tuple):
@@ -712,6 +720,27 @@ class TTYEvent(tuple):
         elif type == TTY_SIZE:
             rows, columns = attrs
             return f'Size(rows={rows}, columns={columns})'
+        elif type == TTY_MOUSE:
+            button, mode, (line, column) = attrs
+            names = []
+            names.append('\u2207' if mode & KEY_MODE_PRESS else '\u2206')
+            for mask, mode_name in (
+                    (KEY_MODE_ALT, 'alt'),
+                    (KEY_MODE_CTRL, 'ctrl'),
+                    (KEY_MODE_SHIFT, 'shift'),
+            ):
+                if mode & mask:
+                    names.append(mode_name)
+            names.append({
+                0: '\u2205',
+                1: 'left',
+                2: 'right',
+                3: 'middle',
+                4: 'up',
+                5: 'down',
+            }[button])
+            return 'Mouse({} at line={} column={})'.format(
+                '-'.join(names), line, column)
 
 
 @apply
@@ -768,7 +797,7 @@ def p_tty():
 
     # CPR (current position report)
     def extract_cpr(buf):
-        line, column = (int(v) for v in bytes(buf[2:-1]).decode().split(';'))
+        line, column = (int(v) for v in buf[2:-1].decode().split(';'))
         return TTYEvent(TTY_CPR, (line, column))
     add(Pattern.sequence((
         p_string('\x1b['),
@@ -777,6 +806,44 @@ def p_tty():
         p_number,
         p_string('R'),
     )), extract_cpr)
+
+    # Mouse
+    def extract_mouse_sgr(buf):
+        event, line, column = tuple(int(v) for v in buf[3:-1].decode().split(';'))
+        mode = (event >> 2) & 0b111
+        if buf[-1] == 77:  # 'M'
+            mode |= KEY_MODE_PRESS
+        button = (event & 0b11) + 1
+        if event & 64:
+            button += 3
+        return TTYEvent(TTY_MOUSE, (button, mode, (line, column)))
+    add(Pattern.sequence((
+        p_string('\x1b[<'),
+        p_number,
+        p_string(';'),
+        p_number,
+        p_string(';'),
+        p_number,
+        p_byte_pred(lambda b: b in (77, 109)),  # (m|M)
+    )), extract_mouse_sgr)
+
+    def extract_mouse_x10(buf):
+        event, line, column = tuple(b - 32 for b in buf[-3:])
+        mode = (event >> 2) & 0b111
+        if event & 0b11 != 0b11:
+            mode |= KEY_MODE_PRESS
+            button = (event & 0b11) + 1
+            if event & 64:
+                button += 3
+        else:
+            button = 0
+        return TTYEvent(TTY_MOUSE, (button, mode, (line, column)))
+    add(Pattern.sequence((
+        p_string('\x1b[M'),
+        p_byte_pred(lambda b: b >= 32),
+        p_byte_pred(lambda b: b >= 32),
+        p_byte_pred(lambda b: b >= 32),
+    )), extract_mouse_x10)
 
     # chars
     add(p_utf8, lambda buf: TTYEvent(TTY_CHAR, buf.decode()))
@@ -829,6 +896,18 @@ class TTY:
         'write_queue', 'write_event', 'write_buffer', 'write_count',
     )
     DEFAULT_FILE = '/dev/tty'
+    EPILOGUE = (
+        # disable autowrap
+        b'\x1b[?7l'
+        # disable mouse
+        b'\x1b[?1003l'
+        b'\x1b[?1006l'
+        b'\x1b[?1000l'
+        # visible cursor
+        b'\x1b[?25h'
+        # reset color settings
+        b'\x1b[00m'
+    )
 
     def __init__(self, *, file=None, loop=None, color_depth=None):
         if isinstance(file, int):
@@ -912,6 +991,8 @@ class TTY:
             self.events_queue.put_nowait(TTYEvent(TTY_CLOSE, None))
             # restore tty attributes
             termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs_old)
+            # write epilogue
+            self.write_sync(self.EPILOGUE)
             # unregister descriptor
             os.set_blocking(self.fd, True)
             self.write_event(None)
@@ -1007,9 +1088,31 @@ class TTY:
 
     def autowrap_set(self, enable):
         if enable:
-            self.write('\033[?7h')
+            self.write('\x1b[?7h')
         else:
-            self.write('\033[?7l')
+            self.write('\x1b[?7l')
+
+    def alternative_screen_set(self, enable):
+        if enable:
+            self.write('\x1b[?1049h')
+        else:
+            self.write('\x1b[?1049l')
+
+    def mouse_set(self, enable, motion=False):
+        if enable:
+            self.write('\x1b[?1000h')             # SET_VT200_MOUSE
+            self.write('\x1b[?1006h')             # SET_SGR_EXT_MODE_MOUSE
+            motion and self.write('\x1b[?1003h')  # SET_ANY_EVENT_MOUSE
+        else:
+            self.write('\x1b[?1003l')
+            self.write('\x1b[?1006l')
+            self.write('\x1b[?1000l')
+
+    def cursor_visibility_set(self, visible):
+        if visible:
+            self.write('\x1b[?25h')
+        else:
+            self.write('\x1b[?25l')
 
     def cursor_to(self, row=0, column=0):
         self.write(f'\x1b[{row};{column}H')
@@ -1077,12 +1180,6 @@ class TTY:
 
         self.write_sync(b'\x1b[6n')
         return await cpr
-
-    def cursor_hide(self):
-        self.write('\x1b[?25l')
-
-    def cursor_show(self):
-        self.write('\x1b[?12l\x1b[?25h')
 
     def erase_line(self) -> None:
         self.write('\x1b[K')
@@ -1812,12 +1909,13 @@ async def select(
             type, attrs = event
             if type == TTY_KEY:
                 name, mode = attrs
-                if name in 'cg':
-                    break
-                if name == 'm':
-                    selected = table.selected
-                    result = -1 if selected is None else selected.index
-                    break
+                if mode == KEY_MODE_CTRL:
+                    if name in 'cg':
+                        break
+                    if name == 'm':
+                        selected = table.selected
+                        result = -1 if selected is None else selected.index
+                        break
             input(event)
             table(event)
             render()
@@ -1825,7 +1923,6 @@ async def select(
         tty.cursor_to(line, column)
         tty.write('\x1b[00m')
         tty.erase_down()
-        tty.autowrap_set(True)
         tty.flush()
         table_update_task.cancel()
 

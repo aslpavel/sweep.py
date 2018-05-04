@@ -1403,10 +1403,13 @@ class Face(tuple):
             FACE_RENDER_CACHE[self] = seq
         stream.write(seq)
 
-    def __repr__(self):
+    def __str__(self):
         stream = io.StringIO()
         self.render(stream)
-        return f'Face({stream.getvalue()} X \x1b[m)'
+        return stream.getvalue()
+
+    def __repr__(self):
+        return f'Face({str(self)} X \x1b[m)'
 
 
 class Text:
@@ -1531,13 +1534,11 @@ class Text:
 
     def __str__(self):
         stream = io.StringIO()
-        stream.write('Text(\'')
         self.render(stream)
-        stream.write('\')')
         return stream.getvalue()
 
     def __repr__(self):
-        return str(self)
+        return f'Text(\'{str(self)}\')'
 
 
 # ------------------------------------------------------------------------------

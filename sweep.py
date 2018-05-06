@@ -1737,25 +1737,33 @@ class InputWidget:
             name, mode = attrs
             if name == 'left':
                 self.cursor = max(0, self.cursor - 1)
+                return True
             elif name == 'right':
                 self.cursor = min(len(self.buffer), self.cursor + 1)
+                return True
             elif mode & KEY_MODE_CTRL:
                 if name == 'a':
                     self.cursor = 0
+                    return True
                 elif name == 'e':
                     self.cursor = len(self.buffer)
+                    return True
                 elif name == 'h':  # delete
                     if self.cursor > 0:
                         self.cursor -= 1
                         del self.buffer[self.cursor]
                         self.update(self.buffer)
+                        return True
                 elif name == 'k':
                     del self.buffer[self.cursor:]
                     self.update(self.buffer)
+                    return True
         elif type == TTY_CHAR:
             self.buffer.insert(self.cursor, attrs)
             self.update(self.buffer)
             self.cursor += 1
+            return True
+        return False
 
     def set_prefix(self, prefix):
         self.prefix = prefix
@@ -1792,17 +1800,33 @@ class ListWidget:
             name, mode = attrs
             if name == 'up':
                 self.move(-1)
+                return True
             elif name == 'pageup':
                 self.move(-self.height)
+                return True
             elif name == 'down':
                 self.move(1)
+                return True
             elif name == 'pagedown':
                 self.move(self.height)
+                return True
             elif mode & KEY_MODE_CTRL:
                 if name == 'p':
                     self.move(-1)
+                    return True
                 elif name == 'n':
                     self.move(1)
+                    return True
+        elif type == TTY_MOUSE:
+            button, mode, _ = attrs
+            if mode & KEY_MODE_PRESS:
+                if button == KEY_MOUSE_WHEEL_UP:
+                    self.move(-1)
+                    return True
+                elif button == KEY_MOUSE_WHEEL_DOWN:
+                    self.move(1)
+                    return True
+        return False
 
     @property
     def selected(self):
@@ -1965,7 +1989,7 @@ async def select(
     tty=None,
     executor=None,
     loop=None,
-    theme=None,
+    theme=None
 ):
     """Show text UI to select candidate
 
@@ -2042,6 +2066,7 @@ async def select(
             ProcessPoolExecutor(max_workers=5))
 
         tty.autowrap_set(False)
+        tty.mouse_set(True)
 
         # reserve space (force scroll)
         tty.write('\n' * table.height)
@@ -2063,9 +2088,8 @@ async def select(
                         selected = table.selected
                         result = -1 if selected is None else selected.index
                         break
-            input(event)
-            table(event)
-            render()
+            if any((input(event), table(event))):
+                render()
 
         tty.cursor_to(line, column)
         tty.write('\x1b[00m')

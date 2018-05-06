@@ -418,7 +418,7 @@ def cont(in_done, in_error=None):
             def safe_out_error(error=None):
                 if error is None:
                     try:
-                        raise asyncio.CancelError()
+                        raise asyncio.CancelledError()
                     except Exception:
                         out_error(sys.exc_info())
                 else:
@@ -508,7 +508,7 @@ class Event:
         def handler_once(event):
             handler(event)
             return False
-        self.handlers.append(handler)
+        self.handlers.append(handler_once)
 
     def __await__(self):
         future = asyncio.Future()
@@ -1488,11 +1488,11 @@ class Face(tuple):
                 elif depth == 2:  # true color
                     if len(params) < 3:
                         break
-                    color = Color(
+                    color = Color((
                         params.pop() / 255.0,
                         params.pop() / 255.0,
                         params.pop() / 255.0,
-                    )
+                    ))
                 if param == 38:
                     fg = color
                 else:
@@ -2265,7 +2265,7 @@ def main() -> None:
 
     with ExitStack() as stack:
         @stack.callback
-        def loop_close():
+        def _():
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
         executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))

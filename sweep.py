@@ -909,9 +909,10 @@ class TTY:
       - http://invisible-island.net/xterm/ctlseqs/ctlseqs.html
     """
     __slots__ = (
-        'fd', 'size', 'loop', 'closed', 'color_depth',
+        'fd', 'size', 'loop', 'color_depth',
         'events', 'events_queue',
         'write_queue', 'write_event', 'write_buffer', 'write_count',
+        'closed', 'closed_event',
     )
     DEFAULT_FILE = '/dev/tty'
     EPILOGUE = (
@@ -952,7 +953,8 @@ class TTY:
         self.write_queue = deque()
         self.write_count = 0
 
-        self.closed = self.loop.create_future()
+        self.closed = False
+        self.closed_event = Event()
         cont_run(self._closer(), name='TTY._closer')
 
     @coro
@@ -1001,7 +1003,7 @@ class TTY:
             cont_run(self._writer(), name='TTY._writer')
 
             # wait closed event
-            yield cont_from_future(self.closed)
+            yield cont(self.closed_event.on)
         finally:
             # remove resize handler
             self.loop.remove_signal_handler(signal.SIGWINCH)
@@ -1078,11 +1080,8 @@ class TTY:
         return self
 
     def __exit__(self, et, eo, tb):
-        self.close(eo)
+        self.close()
         return False
-
-    def __await__(self):
-        return self.closed
 
     def __aiter__(self):
         return self
@@ -1094,12 +1093,10 @@ class TTY:
             raise StopAsyncIteration()
         return event
 
-    def close(self, error=None) -> None:
-        if not self.closed.done():
-            if error is None:
-                self.closed.set_result(None)
-            else:
-                self.closed.set_exception(error)
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.closed_event(None)
 
     def fileno(self) -> int:
         return self.fd
@@ -2059,6 +2056,7 @@ async def select(
         render()
 
     def render():
+        # clean screen down
         tty.cursor_to(line, column)
         tty.write('\x1b[00m')
         tty.erase_down()

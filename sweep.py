@@ -2192,7 +2192,7 @@ def main_options():
     parser.add_argument(
         '-n', '--nth',
         type=parse_nth,
-        help='comma-separated list of for limiting search scope',
+        help='comma-separated list of fields for limiting search scope',
     )
     parser.add_argument(
         '-d', '--delimiter',

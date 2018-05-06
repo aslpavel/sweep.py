@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Sweep is a command line fuzzy finer (fzf analog)
 
 TODO:

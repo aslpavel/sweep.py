@@ -880,18 +880,19 @@ class TTYParser:
         while True:
             for index, byte in enumerate(chunk):
                 alive, results, unconsumed = self._parse(byte)
-                if not alive:
-                    if results:
-                        keys.append(results[-1])
-                        self._parse(None)
-                        # reschedule unconsumed for parsing
-                        unconsumed.extend(chunk[index + 1:])
-                        chunk = unconsumed
-                        break
-                    else:
-                        sys.stderr.write('[ERROR] failed to process: {}\n'
-                                         .format(bytes(unconsumed)))
-                        self._parse(None)
+                if alive:
+                    continue
+                if results:
+                    keys.append(results[-1])
+                    # reschedule unconsumed for parsing
+                    unconsumed.extend(chunk[index + 1:])
+                    chunk = unconsumed
+                    self._parse(None)
+                    break
+                else:
+                    sys.stderr.write('[ERROR] failed to process: {}\n'
+                                     .format(bytes(unconsumed)))
+                    self._parse(None)
             else:
                 # all consumed (no break in for loop)
                 break
@@ -1752,15 +1753,15 @@ class InputWidget:
                     if self.cursor > 0:
                         self.cursor -= 1
                         del self.buffer[self.cursor]
-                        self.update(self.buffer)
+                        self.update(''.join(self.buffer))
                         return True
                 elif name == 'k':
                     del self.buffer[self.cursor:]
-                    self.update(self.buffer)
+                    self.update(''.join(self.buffer))
                     return True
         elif type == TTY_CHAR:
             self.buffer.insert(self.cursor, attrs)
-            self.update(self.buffer)
+            self.update(''.join(self.buffer))
             self.cursor += 1
             return True
         return False
@@ -1981,6 +1982,24 @@ class Candidate(tuple):
         return Candidate, tuple(self)
 
 
+class SingletonTask:
+    def __init__(self, loop=None):
+        self.loop = loop or asyncio.get_event_loop()
+        self.task = None
+
+    def __call__(self, task):
+        if self.task is not None:
+            self.task.cancel()
+        self.task = asyncio.ensure_future(task, loop=self.loop)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, eo, tb):
+        if self.task is not None:
+            self.task.cancel()
+
+
 async def select(
     candidates,
     *,
@@ -2018,8 +2037,8 @@ async def select(
     input.set_prefix(prefix)
     table = ListWidget([], height, item_to_text)
 
-    async def table_update_coro(niddle):
-        niddle = ''.join(niddle)
+    async def table_update(niddle):
+        # rank
         start = time.time()
         result = await rank(
             fuzzy_scorer,
@@ -2029,6 +2048,7 @@ async def select(
             executor=executor,
         )
         stop = time.time()
+        # set suffix
         input.set_suffix(
             Text(' \ue0b2').mark(face_base_fg) +
             Text(
@@ -2037,15 +2057,6 @@ async def select(
         )
         table.reset(result)
         render()
-
-    def table_update(niddle):
-        nonlocal table_update_task
-        table_update_task.cancel()
-        table_update_task = asyncio.ensure_future(
-            table_update_coro(niddle))
-        return True
-    table_update_task = loop.create_future()
-    input.update.on(table_update)
 
     def render():
         tty.cursor_to(line, column)
@@ -2057,13 +2068,16 @@ async def select(
         # show input
         tty.cursor_to(line, column)
         input.render(tty, theme)
-        # flush output
+        # flush frame
         tty.flush()
 
     with ExitStack() as stack:
         tty = tty or stack.enter_context(TTY(loop=loop))
         executor = executor or stack.enter_context(
             ProcessPoolExecutor(max_workers=5))
+        table_update_task = stack.enter_context(SingletonTask())
+        input.update.on(
+            lambda niddle: (table_update_task(table_update(niddle)),))
 
         tty.autowrap_set(False)
         tty.mouse_set(True)
@@ -2074,7 +2088,7 @@ async def select(
         tty.flush()
 
         line, column = await tty.cursor_cpr()
-        table_update('')
+        input.update('')  # force table update
 
         result = -1
         async for event in tty:
@@ -2095,7 +2109,6 @@ async def select(
         tty.write('\x1b[00m')
         tty.erase_down()
         tty.flush()
-        table_update_task.cancel()
 
         return result
 

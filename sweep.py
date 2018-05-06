@@ -2231,15 +2231,30 @@ def main() -> None:
 
     loop = asyncio.get_event_loop()
     if options.debug:
+        # enable asyncio debugging
         import logging
         loop.set_debug(True)
         logging.getLogger('asyncio').setLevel(logging.INFO)
 
-    # make stdin not fail on bad input
-    sys.stdin = codecs.getreader('utf-8')(
-        sys.stdin.detach(), errors='backslashreplace')
+        # debug lable callback
+        def debug_label(event):
+            label = ' '.join((
+                '',
+                f'event: {event}',
+                f'write_count: {tty.write_count}',
+                '',
+            ))
+            tty.cursor_to(0, 0)
+            Text(label).mark(face_debug_label).render(tty)
+            tty.erase_line()
+            return True
+        face_debug_label = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
+    else:
+        debug_label = lambda _: False
 
     # generat candidates from stdin
+    sys.stdin = codecs.getreader('utf-8')(
+        sys.stdin.detach(), errors='backslashreplace')
     candidates = [Candidate.from_str(
         line.rstrip(),
         delimiter=options.delimiter,
@@ -2248,42 +2263,28 @@ def main() -> None:
     if options.reversed:
         candidates = candidates[::-1]
 
-    try:
-        with ExitStack() as stack:
-            executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
-            tty = stack.enter_context(TTY(
-                loop=loop,
-                color_depth=options.color_depth,
-            ))
+    with ExitStack() as stack:
+        @stack.callback
+        def loop_close():
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
+        tty = stack.enter_context(TTY(
+            loop=loop,
+            color_depth=options.color_depth,
+        ))
+        tty.events.on(debug_label)
 
-            if options.debug:
-                def debug_label(event):
-                    label = ' '.join((
-                        '',
-                        f'event: {event}',
-                        f'write_count: {tty.write_count}',
-                        '',
-                    ))
-                    tty.cursor_to(0, 0)
-                    Text(label).mark(face_key).render(tty)
-                    tty.erase_line()
-                    return True
-                face_key = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
-                tty.events.on(debug_label)
-
-            selected = loop.run_until_complete(select(
-                candidates,
-                prompt=options.prompt,
-                loop=loop,
-                tty=tty,
-                executor=executor,
-                theme=options.theme,
-            ))
-        if selected >= 0:
-            print(candidates[selected].to_str())
-    finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        selected = loop.run_until_complete(select(
+            candidates,
+            prompt=options.prompt,
+            loop=loop,
+            tty=tty,
+            executor=executor,
+            theme=options.theme,
+        ))
+    if selected >= 0:
+        print(candidates[selected].to_str())
 
 
 if __name__ == '__main__':

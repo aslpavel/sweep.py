@@ -2,8 +2,6 @@
 """Sweep is a command line fuzzy finer (fzf analog)
 
 TODO:
-  - use something instead of future in closer coro as it fails to complete
-    if loop is not running
   - validate that loop is not `kqueue` based
   - use lighter queues?
   - unittests

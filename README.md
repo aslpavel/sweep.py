@@ -1,5 +1,5 @@
 ### Sweep.py
-Seep is yet another command line fuzzy finder (fzf analog)
+`sweep.py` is yet another command line fuzzy finder (fzf analog)
 
 ### Features
   - single source file
@@ -33,4 +33,4 @@ bind '"\C-r": " \C-e\C-u\C-y\ey\C-u`__sweep_history__`\e\C-e\er\e^"'
 
 ### Demo
 Dark/Light themes, 100000 words lookup:
-![demo](/demo/demo.gif "demo")
+![demo](/demo/demo.gif =512x)

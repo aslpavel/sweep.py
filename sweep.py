@@ -1207,6 +1207,10 @@ class TTY:
 COLOR_DEPTH_24 = 1
 COLOR_DEPTH_8 = 2
 COLOR_DEPTH_4 = 3
+if os.environ.get('COLORTERM') in ('truecolor', '24bit'):
+    COLOR_DEPTH_DEFAULT = COLOR_DEPTH_24
+else:
+    COLOR_DEPTH_DEFAULT = COLOR_DEPTH_8
 
 
 class Color(tuple):
@@ -1281,7 +1285,7 @@ class Color(tuple):
     def sgr(self, is_fg, depth=None):
         """Return part of SGR sequence responsible for picking this color
         """
-        depth = depth or COLOR_DEPTH_24
+        depth = depth or COLOR_DEPTH_DEFAULT
         r, g, b, _ = self
 
         if depth == COLOR_DEPTH_24:
@@ -1790,7 +1794,7 @@ class ListWidget:
         self.height = height
         self.item_to_text = item_to_text
 
-    def __call__(self, event):
+    def __call__(self, event: TTYEvent) -> bool:
         type, attrs = event
         if type == TTY_KEY:
             name, mode = attrs
@@ -1832,7 +1836,7 @@ class ListWidget:
         else:
             return None
 
-    def move(self, count):
+    def move(self, count: int) -> None:
         self.cursor += count
         if self.cursor < 0:
             self.offset += self.cursor
@@ -2209,7 +2213,7 @@ def main_options():
     parser.add_argument(
         '--color-depth',
         type=parse_color_depth,
-        default=COLOR_DEPTH_24,
+        default=COLOR_DEPTH_DEFAULT,
         help='color depth',
     )
     parser.add_argument(

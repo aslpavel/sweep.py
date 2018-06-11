@@ -329,7 +329,7 @@ def p_byte_pred(pred):
 @apply
 def p_utf8():
     printable_set = set(ord(c) for c in (
-        string.ascii_letters + string.digits + string.punctuation + '\t '))
+        string.ascii_letters + string.digits + string.punctuation + ' '))
     printable = p_byte_pred(lambda b: b in printable_set)
     utf8_two = p_byte_pred(lambda b: b >> 5 == 0b110)
     utf8_three = p_byte_pred(lambda b: b >> 4 == 0b1110)
@@ -760,6 +760,12 @@ class TTYEvent(tuple):
 
 @apply
 def p_tty():
+    r"""Pattern matching tty input
+
+    NOTE:
+      \n - ctrl-j
+      \t - ctrl-i
+    """
     def add(pattern, mapper):
         if isinstance(pattern, (str, bytes)):
             pattern = p_string(pattern)
@@ -1725,11 +1731,15 @@ class InputWidget:
     __slots__ = ('buffer', 'cursor', 'update', 'prefix', 'suffix')
 
     def __init__(self, buffer=None, cursor=None):
-        self.buffer = [] if buffer is None else list(buffer)
-        self.cursor = len(self.buffer) if cursor is None else cursor
         self.prefix = Text('')
         self.suffix = Text('')
         self.update = Event()
+        self.set(buffer, cursor)
+
+    def set(self, buffer=None, cursor=None):
+        self.buffer = [] if buffer is None else list(buffer)
+        self.cursor = len(self.buffer) if cursor is None else cursor
+        self.update(''.join(self.buffer))
 
     def __call__(self, event):
         type, attrs = event
@@ -1830,6 +1840,7 @@ class ListWidget:
 
     @property
     def selected(self):
+        """Current selected item"""
         current = self.offset + self.cursor
         if 0 <= current < len(self.items):
             return self.items[current]
@@ -2098,10 +2109,15 @@ async def select(
                 if mode == KEY_MODE_CTRL:
                     if name in 'cg':
                         break
-                    if name == 'm':
+                    elif name == 'm':
                         selected = table.selected
                         result = -1 if selected is None else selected.index
                         break
+                    elif name == 'i':  # \t completion
+                        selected = table.selected
+                        if selected is not None:
+                            input.set(str(selected.haystack))
+                            render()
             if any((input(event), table(event))):
                 render()
 

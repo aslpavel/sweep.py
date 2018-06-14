@@ -2267,6 +2267,7 @@ def main() -> None:
             tty.cursor_to(0, 0)
             Text(label).mark(face_debug_label).render(tty)
             tty.erase_line()
+            tty.flush()
             return True
         face_debug_label = Face(bg=Color('#cc241d'), fg=Color('#ebdbb2'))
     else:

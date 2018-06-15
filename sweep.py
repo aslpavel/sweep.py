@@ -662,7 +662,7 @@ def _rank_task(scorer, niddle, haystack, offset):
     return result
 
 
-async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
+async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop=None):
     """Score haystack against niddle in execturo and return sorted result
     """
     loop = loop or asyncio.get_event_loop()
@@ -679,7 +679,8 @@ async def rank(scorer, niddle, haystack, *, executor=None, loop=None):
         ) for offset in range(0, len(haystack), batch_size)
     ), loop=loop)
     results = [item for batch in batches for item in batch]
-    results.sort()
+    if not keep_order:
+        results.sort()
 
     return results
 
@@ -1739,6 +1740,9 @@ class InputWidget:
     def set(self, buffer=None, cursor=None):
         self.buffer = [] if buffer is None else list(buffer)
         self.cursor = len(self.buffer) if cursor is None else cursor
+        self.notify()
+
+    def notify(self):
         self.update(''.join(self.buffer))
 
     def __call__(self, event):
@@ -1762,15 +1766,15 @@ class InputWidget:
                     if self.cursor > 0:
                         self.cursor -= 1
                         del self.buffer[self.cursor]
-                        self.update(''.join(self.buffer))
+                        self.notify()
                         return True
                 elif name == 'k':
                     del self.buffer[self.cursor:]
-                    self.update(''.join(self.buffer))
+                    self.notify()
                     return True
         elif type == TTY_CHAR:
             self.buffer.insert(self.cursor, attrs)
-            self.update(''.join(self.buffer))
+            self.notify()
             self.cursor += 1
             return True
         return False
@@ -2013,6 +2017,7 @@ class SingletonTask:
 async def select(
     candidates,
     *,
+    keep_order=None,
     height=None,
     prompt=None,
     tty=None,
@@ -2056,6 +2061,7 @@ async def select(
             candidates,
             loop=loop,
             executor=executor,
+            keep_order=keep_order,
         )
         stop = time.time()
         # set suffix
@@ -2118,6 +2124,9 @@ async def select(
                         if selected is not None:
                             input.set(str(selected.haystack))
                             render()
+                    elif name == 'r':
+                        keep_order = not keep_order
+                        input.notify()
             if any((input(event), table(event))):
                 render()
 
@@ -2237,6 +2246,11 @@ def main_options():
         action='store_true',
         help='enable debugging',
     )
+    parser.add_argument(
+        '--keep-order',
+        action='store_true',
+        help='keep order (don\'t use ranking score)',
+    )
     return parser.parse_args()
 
 
@@ -2303,6 +2317,7 @@ def main() -> None:
             tty=tty,
             executor=executor,
             theme=options.theme,
+            keep_order=options.keep_order,
         ))
     if selected >= 0:
         print(candidates[selected].to_str())

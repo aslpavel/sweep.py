@@ -2127,7 +2127,11 @@ async def select(
                     elif name == 'r':
                         keep_order = not keep_order
                         input.notify()
-            if any((input(event), table(event))):
+            if any((
+                type == TTY_SIZE,
+                input(event),
+                table(event),
+            )):
                 render()
 
         tty.cursor_to(line, column)

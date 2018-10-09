@@ -644,6 +644,23 @@ def fuzzy_scorer(niddle, haystack):
     return _fuzzy_scorer(niddle, haystack)
 
 
+def substr_scorer(niddle, haystack):
+    index = haystack.find(niddle)
+    niddle_len = len(niddle)
+    if index < 0:
+        return float('-inf'), None
+    elif index == 0 and niddle_len != 0 and len(haystack) == niddle_len:
+        return float('inf'), list(range(niddle_len))
+    else:
+        return -index, list(range(index, index + niddle_len))
+
+
+SCORER_DEFAULT = 'fuzzy'
+SCORERS = {
+    'fuzzy': fuzzy_scorer,
+    'substr': substr_scorer,
+}
+
 RankResult = namedtuple('RankResult', (
     'score',
     'index',
@@ -1705,6 +1722,8 @@ def Theme(base, match, fg, bg):
     theme_dict = {
         'base_bg': Face(bg=base).with_fg_contrast(fg, bg),
         'base_fg': Face(fg=base, bg=bg),
+        'base_bg_1': Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
+        'base_fg_1': Face,
         'match': Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
         'input_default': Face(fg=fg, bg=bg),
         'list_dot': Face(fg=base),
@@ -2014,9 +2033,37 @@ class SingletonTask:
             self.task.cancel()
 
 
+class ScorerToggler:
+    __slots__ = ('scorers', 'index',)
+
+    def __init__(self, scorer=None):
+        scorers, index = [], None
+        for i, (n, s) in enumerate(SCORERS.items()):
+            if s is scorer:
+                index = i
+            scorers.append((n, s))
+        if index is None:
+            scorers.append(('custom', scorer))
+            index = len(scorers) - 1
+        self.index = index
+        self.scorers = scorers
+
+    @property
+    def scorer(self):
+        return self.scorers[self.index][1]
+
+    @property
+    def name(self):
+        return self.scorers[self.index][0]
+
+    def next(self):
+        self.index = (self.index + 1) % len(self.scorers)
+
+
 async def select(
     candidates,
     *,
+    scorer=None,
     keep_order=None,
     height=None,
     prompt=None,
@@ -2033,6 +2080,7 @@ async def select(
     height = height or 10
     theme = theme or THEME_DEFAULT
     loop = loop or asyncio.get_event_loop()
+    scorer = ScorerToggler(scorer or SCORERS[SCORER_DEFAULT])
 
     face_base_fg = theme.base_fg
     face_base_bg = theme.base_bg
@@ -2056,7 +2104,7 @@ async def select(
         # rank
         start = time.time()
         result = await rank(
-            fuzzy_scorer,
+            scorer.scorer,
             niddle,
             candidates,
             loop=loop,
@@ -2065,12 +2113,14 @@ async def select(
         )
         stop = time.time()
         # set suffix
-        input.set_suffix(
-            Text(' \ue0b2').mark(face_base_fg) +
-            Text(
-                f' {len(result)}/{len(candidates)} {stop - start:.2f}s '
-            ).mark(face_base_bg)
-        )
+        input.set_suffix(reduce(op.add, (
+            Text(' \ue0b2').mark(face_base_fg),
+            Text(f' {len(result)}/{len(candidates)} {stop - start:.2f}s').mark(face_base_bg),
+            Text(' [{}{}]'.format(
+                '\ue0a2' if keep_order else '',
+                scorer.name[0].upper(),
+            )).mark(face_base_bg),
+        )))
         table.reset(result)
         render()
 
@@ -2126,6 +2176,9 @@ async def select(
                             render()
                     elif name == 'r':
                         keep_order = not keep_order
+                        input.notify()
+                    elif name == 's':
+                        scorer.next()
                         input.notify()
             if any((
                 type == TTY_SIZE,
@@ -2193,6 +2246,13 @@ def main_options():
                 f'invalid depth: {argument} (allowed [{",".join(depths)}])')
         return depth
 
+    def parse_scorer(argument):
+        scorer = SCORERS.get(argument)
+        if scorer is None:
+            raise argparse.ArgumentTypeError(
+                f'invalid scorer: {argument} (allowed [{",".join(SCORERS.keys())}])')
+        return scorer
+
     def parse_theme(argument):
         attrs = dict(THEME_DARK_ATTRS)
         for attr in argument.lower().split(','):
@@ -2255,6 +2315,16 @@ def main_options():
         action='store_true',
         help='keep order (don\'t use ranking score)',
     )
+    parser.add_argument(
+        '--scorer',
+        type=parse_scorer,
+        default=SCORERS.get(SCORER_DEFAULT),
+        help='default scorer to rank candidates',
+    )
+    parser.add_argument(
+        '--tty-device',
+        help='tty device file (useful for debugging)',
+    )
     return parser.parse_args()
 
 
@@ -2309,6 +2379,7 @@ def main() -> None:
             loop.close()
         executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
         tty = stack.enter_context(TTY(
+            file=options.tty_device,
             loop=loop,
             color_depth=options.color_depth,
         ))
@@ -2322,6 +2393,7 @@ def main() -> None:
             executor=executor,
             theme=options.theme,
             keep_order=options.keep_order,
+            scorer=options.scorer,
         ))
     if selected >= 0:
         print(candidates[selected].to_str())

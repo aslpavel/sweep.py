@@ -645,14 +645,20 @@ def fuzzy_scorer(niddle, haystack):
 
 
 def substr_scorer(niddle, haystack):
-    index = haystack.find(niddle)
-    niddle_len = len(niddle)
-    if index < 0:
-        return float('-inf'), None
-    elif index == 0 and niddle_len != 0 and len(haystack) == niddle_len:
-        return float('inf'), list(range(niddle_len))
-    else:
-        return -index, list(range(index, index + niddle_len))
+    positions, offset = [], 0
+    for niddle in niddle.split(' '):
+        if not niddle:
+            continue
+        offset = haystack.find(niddle, offset)
+        if offset < 0:
+            return float('-inf'), None
+        niddle_len = len(niddle)
+        positions.extend(range(offset, offset + niddle_len))
+        offset += niddle_len
+    if not positions:
+        return 0, positions
+    match_len = positions[-1] + 1 - positions[0]
+    return - match_len + 2 / (positions[0] + 1) + 1 / (positions[-1] + 1), positions
 
 
 SCORER_DEFAULT = 'fuzzy'

@@ -834,11 +834,17 @@ def p_tty():
         add(p_byte(27) + p_byte(b), key(chr(b), KEY_MODE_ALT))
     for b in range(ord('0'), ord('9') + 1):
         add(p_byte(27) + p_byte(b), key(chr(b), KEY_MODE_ALT))
+    for b in map(ord, '`~!@#$%^&*()-_=+[{]}\\|;:\'",<.>/?'):
+        add(p_byte(27) + p_byte(b), key(chr(b), KEY_MODE_ALT))
 
     # ctrl-letter
     for b in range(1, 27):
         add(p_byte(b), key(chr(b + 96), KEY_MODE_CTRL))
     add('\x7f', key('h', KEY_MODE_CTRL))  # backspace
+    add('\x1f', key('/', KEY_MODE_CTRL))
+    add('\x1c', key('\\', KEY_MODE_CTRL))
+    add('\x1e', key('^', KEY_MODE_CTRL))
+    add('\x1d', key(']', KEY_MODE_CTRL))
 
     # CPR (current position report)
     def extract_cpr(buf):

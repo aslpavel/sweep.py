@@ -646,6 +646,7 @@ def fuzzy_scorer(niddle, haystack):
 
 def substr_scorer(niddle, haystack):
     positions, offset = [], 0
+    niddle, haystack = niddle.lower(), haystack.lower()
     for niddle in niddle.split(' '):
         if not niddle:
             continue

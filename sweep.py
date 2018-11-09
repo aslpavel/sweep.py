@@ -1650,6 +1650,14 @@ class Text:
                 chunks.extend(self._chunks)
         return Text(chunks)
 
+    def chunk(self, size):
+        text, chunks = self, []
+        while text:
+            chunk, text = text.split(size)
+            chunks.append(chunk)
+        chunks = chunks or [self]
+        return chunks
+
     def __getitem__(self, selector):
         if isinstance(selector, slice):
             start, stop = selector.start, selector.stop
@@ -1761,12 +1769,14 @@ THEME_DEFAULT = Theme(**THEME_DARK_ATTRS)
 
 
 class InputWidget:
-    __slots__ = ('buffer', 'cursor', 'update', 'prefix', 'suffix')
+    __slots__ = ('buffer', 'cursor', 'update', 'prefix', 'suffix', 'tty', 'theme')
 
-    def __init__(self, buffer=None, cursor=None):
+    def __init__(self, tty, theme=None, buffer=None, cursor=None):
         self.prefix = Text('')
         self.suffix = Text('')
         self.update = Event()
+        self.tty = tty
+        self.theme = theme or THEME_DEFAULT
         self.set(buffer, cursor)
 
     def set(self, buffer=None, cursor=None):
@@ -1817,9 +1827,9 @@ class InputWidget:
     def set_suffix(self, suffix):
         self.suffix = suffix
 
-    def render(self, tty, theme=None):
-        theme = theme or THEME_DEFAULT
-        face = theme.input_default
+    def render(self):
+        tty = self.tty
+        face = self.theme.input_default
         face.render(tty)
         tty.erase_line()
         self.prefix.render(tty, face)
@@ -1831,14 +1841,20 @@ class InputWidget:
 
 
 class ListWidget:
-    __slots__ = ('items', 'height', 'offset', 'cursor', 'item_to_text',)
+    __slots__ = ('items', 'height', 'offset', 'cursor', 'item_to_text',
+                 'layout', 'layout_height', 'tty', 'theme')
 
-    def __init__(self, items, height, item_to_text):
-        self.items = items
-        self.cursor = 0
-        self.offset = 0
-        self.height = height
-        self.item_to_text = item_to_text
+    def __init__(self, tty, items=None, height=None, item_to_text=None, theme=None):
+        self.items = items or []    # list of all items
+        self.cursor = 0             # selected item in visible items
+        self.offset = 0             # offset of first rendered item
+        self.height = height or 10  # height of the widget
+        self.item_to_text = item_to_text or (lambda i: i)  # how to convert item to a text
+        self.layout = []            # [[default_face, left_margin, text, scorllbar]]
+        self.layout_height = 0      # number of items show in layout
+        self.tty = tty
+        self.theme = theme or THEME_DEFAULT
+        self.update_layout()
 
     def __call__(self, event: TTYEvent) -> bool:
         type, attrs = event
@@ -1872,6 +1888,9 @@ class ListWidget:
                 elif button == KEY_MOUSE_WHEEL_DOWN:
                     self.move(1)
                     return True
+        elif type == TTY_SIZE:
+            self.update_layout()
+            return True
         return False
 
     @property
@@ -1891,66 +1910,80 @@ class ListWidget:
             if self.offset < 0:
                 self.offset = 0
         elif self.offset + self.cursor < len(self.items):
-            if self.cursor >= self.height:
-                self.offset += self.cursor - self.height + 1
-                self.cursor = self.height - 1
+            if self.cursor >= self.layout_height:
+                self.offset += self.cursor - self.layout_height + 1
+                self.cursor = self.layout_height - 1
         else:
             if self.cursor >= len(self.items):
                 self.offset, self.cursor = 0, len(self.items) - 1
             else:
-                self.cursor = self.height - 1
+                self.cursor = self.layout_height - 1
                 self.offset = len(self.items) - self.cursor - 1
+        self.update_layout()
 
     def reset(self, items):
         self.cursor = 0
         self.offset = 0
         self.items = items
+        self.update_layout()
 
-    def render(self, tty, theme=None):
-        theme = theme or THEME_DEFAULT
-        face_selected = theme.list_selected
-        face_default = theme.list_default
-        face_scrollbar_on = theme.list_scrollbar_on
-        face_scrollbar_off = theme.list_scrollbar_off
-        face_dot = theme.list_dot
+    def update_layout(self):
+        width = self.tty.size.width
+        theme = self.theme
+        layout = []  # [[default_face, left_margin, text, scorllbar]]
 
-        # scroll bar
-        scrollbar = [False] * self.height
+        line_index = 0  # current line of layout
+        index = 0       # index of item starting with `self.offset`
+        while line_index < self.height:
+            if 0 <= self.offset + index < len(self.items):
+                face = theme.list_selected if self.cursor == index else theme.list_default
+                text = self.item_to_text(self.items[self.offset + index])
+                for chunk_index, chunk in enumerate(text.chunk(width - 4)):
+                    if self.cursor == index and chunk_index == 0:
+                        left_margin = Text(' \u25cf ').mark(theme.list_dot)
+                    else:
+                        left_margin = Text('   ')
+                    layout.append([face, left_margin, chunk])
+                    line_index += 1
+                index += 1
+            else:
+                layout.append([theme.list_default, Text('   '), Text('')])
+                line_index += 1
+
+        # only keep `self.height` lines in layout
+        if self.cursor + 1 == index and index != 0:
+            layout = layout[-self.height:]
+        else:
+            layout = layout[:self.height]
+
+        # fill scroll bar
         if self.items:
-            items_len = len(self.items)
-            filled = max(1, min(self.height, self.height ** 2 // items_len))
-            empty = round((self.height - filled) * (self.offset + self.cursor)
-                          / items_len)
-            for fill in range(empty, empty + filled):
-                scrollbar[fill] = True
+            sb_filled = max(1, min(self.height, self.height * index // len(self.items)))
+            sb_empty = round((self.height - sb_filled) * (self.offset + self.cursor)
+                             / len(self.items))
+        else:
+            sb_filled = self.height
+            sb_empty = 0
+        sb_text = Text(' ')
+        for line_index, line in enumerate(layout):
+            if sb_empty <= line_index < sb_empty + sb_filled:
+                line.append(sb_text.mark(line[0].overlay(theme.list_scrollbar_on)))
+            else:
+                line.append(sb_text.mark(line[0].overlay(theme.list_scrollbar_off)))
 
-        # lines
-        width = tty.size.width
-        for line in range(self.height):
-            # pointer
-            if self.items and line == self.cursor:
-                face = face_selected
-                face.render(tty)
-                Text(' \u25cf ').mark(face_dot).render(tty, face)
-            else:
-                face = face_default
-                face.render(tty)
-                tty.write('   ')
-            # text
-            index = self.offset + line
-            if 0 <= index < len(self.items):
-                (self
-                 .item_to_text(self.items[index])[:width - 4]
-                 .render(tty, face))
+        self.layout = layout
+        self.layout_height = index
+
+    def render(self):
+        tty = self.tty
+        width = self.tty.size.width
+        for face, left, text, right in self.layout:
+            face.render(tty)
+            left.render(tty, face)
+            text.render(tty, face)
             tty.erase_line()  # will fill with current color
-            # scroll bar
             tty.cursor_to_column(width)
-            if scrollbar[line]:
-                face.overlay(face_scrollbar_on).render(tty)
-            else:
-                face.overlay(face_scrollbar_off).render(tty)
-            tty.write(' ')
-            # next line
+            right.render(tty)
             tty.cursor_to_column(0)
             tty.cursor_down(1)
         tty.write('\x1b[m')
@@ -2105,14 +2138,6 @@ async def select(
         else:
             return Text(item.haystack).mark_mask(face_match, item.positions)
 
-    prefix = reduce(op.add, (
-        Text(f' {prompt} ').mark(face_base_bg),
-        Text('\ue0b0 ').mark(face_base_fg),
-    ))
-    input = InputWidget()
-    input.set_prefix(prefix)
-    table = ListWidget([], height, item_to_text)
-
     async def table_update(niddle):
         # rank
         start = time.time()
@@ -2144,10 +2169,10 @@ async def select(
         tty.erase_down()
         # show table
         tty.cursor_to(line + 1, column)
-        table.render(tty, theme)
+        table.render()
         # show input
         tty.cursor_to(line, column)
-        input.render(tty, theme)
+        input.render()
         # flush frame
         tty.flush()
 
@@ -2155,6 +2180,15 @@ async def select(
         tty = tty or stack.enter_context(TTY(loop=loop))
         executor = executor or stack.enter_context(
             ProcessPoolExecutor(max_workers=5))
+
+        prefix = reduce(op.add, (
+            Text(f' {prompt} ').mark(face_base_bg),
+            Text('\ue0b0 ').mark(face_base_fg),
+        ))
+        input = InputWidget(tty, theme=theme)
+        input.set_prefix(prefix)
+        table = ListWidget(tty, height=height, item_to_text=item_to_text, theme=theme)
+
         table_update_task = stack.enter_context(SingletonTask())
         input.update.on(
             lambda niddle: (table_update_task(table_update(niddle)),))
@@ -2282,6 +2316,15 @@ def main_options():
                     attrs[key] = value
         return Theme(**attrs)
 
+    def parse_height(argument):
+        try:
+            height = int(argument)
+            if height <= 0:
+                raise ValueError()
+            return height
+        except ValueError:
+            raise argparse.ArgumentTypeError(f'hieght must a postivie integer: {argument}')
+
     parser = argparse.ArgumentParser(description=textwrap.dedent("""\
     Sweep is a command line fuzzy finer (fzf analog)
     """))
@@ -2337,6 +2380,11 @@ def main_options():
     parser.add_argument(
         '--tty-device',
         help='tty device file (useful for debugging)',
+    )
+    parser.add_argument(
+        '--height',
+        type=parse_height,
+        help='height of the list show',
     )
     return parser.parse_args()
 
@@ -2407,6 +2455,7 @@ def main() -> None:
             theme=options.theme,
             keep_order=options.keep_order,
             scorer=options.scorer,
+            height=options.height,
         ))
     if selected >= 0:
         print(candidates[selected].to_str())

@@ -2212,7 +2212,7 @@ async def select(
                 if mode == KEY_MODE_CTRL:
                     if name in 'cg':
                         break
-                    elif name == 'm':
+                    elif name in 'mj':
                         selected = table.selected
                         result = -1 if selected is None else selected.index
                         break

@@ -1737,7 +1737,7 @@ class Text:
 # ------------------------------------------------------------------------------
 def Theme(base, match, fg, bg):
     base = Color(base)
-    match = base.with_alpha(.5) if match is None else Color(match)
+    match = base.with_alpha(.35) if match is None else Color(match)
     fg = Color(fg)
     bg = Color(bg)
     theme_dict = {

@@ -1468,7 +1468,7 @@ class Face(tuple):
 
     def with_sgr(self, params):
         if not params:
-            return Face()
+            return self
         ansi_colors = (
             (0, 0, 0),
             (.5, 0, 0),
@@ -2182,7 +2182,7 @@ async def select(
             ProcessPoolExecutor(max_workers=5))
 
         prefix = reduce(op.add, (
-            Text(f' {prompt} ').mark(face_base_bg),
+            Text(f' {prompt} ').mark(face_base_bg.overlay(Face(attrs=FACE_BOLD))),
             Text('\ue0b0 ').mark(face_base_fg),
         ))
         input = InputWidget(tty, theme=theme)

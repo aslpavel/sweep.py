@@ -2103,7 +2103,7 @@ class Candidate(tuple):
                 chunk = yield candidates
                 if chunk is None:
                     line = buffer.strip().decode(errors="backslashreplace")
-                    return [Candidate.from_str(line)] if line else []
+                    return [from_str(line)] if line else []
                 buffer += chunk
                 lines = buffer.split(b"\n")
                 buffer = lines[-1]
@@ -2111,7 +2111,7 @@ class Candidate(tuple):
                     line.strip().decode(errors="backslashreplace")
                     for line in lines[:-1]
                 )
-                candidates = list(map(Candidate.from_str, filter(None, lines)))
+                candidates = list(map(from_str, filter(None, lines)))
 
         def line_decode(chunk):
             try:
@@ -2119,6 +2119,7 @@ class Candidate(tuple):
             except StopIteration as ret:
                 return ret.args[0] if ret.args else []
 
+        from_str = partial(Candidate.from_str, delimiter=delimiter, predicate=predicate)
         line_decoder_gen = line_decoder()
         line_decoder_gen.send(None)
         return line_decode
@@ -2206,6 +2207,12 @@ class CandidatesAsync:
     def __getitem__(self, selector):
         return self.candidates[selector]
 
+    def __bool__(self):
+        return bool(self.candidates)
+
+    def __iter__(self):
+        return iter(self.candidates)
+
     def extend(self, candidates):
         if self.reversed:
             self.candidates, candidates = candidates[::-1], self.candidates
@@ -2288,8 +2295,7 @@ class SingletonTask:
         try:
             task.result()
         except Exception:
-            et, eo, tb = sys.exc_info()
-            traceback.print_tb(tb, file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     def __enter__(self):
         return self
@@ -2354,15 +2360,10 @@ async def select(
 
     def item_to_text(item):
         """How to convert ranked item to text"""
-        if isinstance(item, RankResult):
-            if isinstance(item.haystack, Candidate):
-                return item.haystack.with_positions(item.positions).to_text(theme)
-            else:
-                return Text(item.haystack).mark_mask(face_match, item.positions)
-        elif isinstance(item, Candidate):
-            return item.to_text(theme)
+        if isinstance(item.haystack, Candidate):
+            return item.haystack.with_positions(item.positions).to_text(theme)
         else:
-            return Text(item)
+            return Text(item.haystack).mark_mask(face_match, item.positions)
 
     def suffix(count, time):
         """Text which is rendered as suffix of the input"""
@@ -2394,7 +2395,10 @@ async def select(
                 keep_order=keep_order,
             )
         else:
-            result = candidates.candidates
+            result = [
+                RankResult(0.0, index, candidate, [])
+                for index, candidate in enumerate(candidates)
+            ]
         stop = time.time()
         # set suffix
         input.set_suffix(suffix(len(result), stop - start))

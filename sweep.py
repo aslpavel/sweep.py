@@ -5,6 +5,7 @@ import array
 import asyncio
 import codecs
 import fcntl
+import heapq
 import io
 import itertools as it
 import operator as op
@@ -18,13 +19,12 @@ import time
 import traceback
 import tty
 import warnings
+
 from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
-
 from typing import Iterable
-
 
 # ------------------------------------------------------------------------------
 # Utils
@@ -682,13 +682,15 @@ SCORERS = {"fuzzy": fuzzy_scorer, "substr": substr_scorer}
 RankResult = namedtuple("RankResult", ("score", "index", "haystack", "positions"))
 
 
-def _rank_task(scorer, niddle, haystack, offset):
+def _rank_task(scorer, niddle, haystack, offset, keep_order):
     result = []
     for index, item in enumerate(haystack):
         score, positions = scorer(niddle, str(item))
         if positions is None:
             continue
         result.append(RankResult(-score, index + offset, item, positions))
+    if not keep_order:
+        result.sort()
     return result
 
 
@@ -696,8 +698,7 @@ async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop
     """Score haystack against niddle in execturo and return sorted result
     """
     loop = loop or asyncio.get_event_loop()
-
-    batch_size = 1024
+    batch_size = 4096
     batches = await asyncio.gather(
         *(
             loop.run_in_executor(
@@ -707,15 +708,16 @@ async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop
                 niddle,
                 haystack[offset : offset + batch_size],
                 offset,
+                keep_order,
             )
             for offset in range(0, len(haystack), batch_size)
         ),
         loop=loop,
     )
-    results = [item for batch in batches for item in batch]
     if not keep_order:
-        results.sort()
-
+        results = list(heapq.merge(*batches))
+    else:
+        results = [item for batch in batches for item in batch]
     return results
 
 
@@ -2186,19 +2188,17 @@ class CandidatesAsync:
         self.loop.add_reader(self.fd, self._try_read)
 
     def _try_read(self):
-        try:
-            chunk = os.read(self.fd, 4096)
-            if not chunk:
-                self.close()
-                return
-        except BlockingIOError:
-            pass
-        else:
-            self.extend(self.decoder(chunk))
-            self.notify()
-
-    def notify(self):
-        self.update(self.candidates)
+        while True:
+            try:
+                chunk = os.read(self.fd, 4096)
+                if not chunk:
+                    self.close()
+                    return
+            except BlockingIOError:
+                break
+            else:
+                self.extend(self.decoder(chunk))
+                self.update(False)
 
     def __len__(self):
         return len(self.candidates)
@@ -2217,7 +2217,7 @@ class CandidatesAsync:
             self.loop.remove_reader(fd)
             os.set_blocking(fd, True)
             self.extend(self.decoder(None))
-            self.notify()
+            self.update(True)
 
     def __enter__(self):
         return self
@@ -2228,23 +2228,26 @@ class CandidatesAsync:
 
 def rate_limit_callback(max_frequency, loop=None):
     """Rate limiting decorator
+
+    If callback return not None value, current delay would be multiplied
+    by this value.
     """
 
     def rate_limit_callback(callback):
         def call_at_callback():
-            nonlocal last_call, scheduled
+            nonlocal last_call, scheduled, delay
             scheduled = False
             last_call = event_loop.time()
-            callback()
+            delay *= callback() or 1.0
 
         def rate_limited_callback():
-            nonlocal last_call, scheduled
+            nonlocal last_call, scheduled, delay
             if scheduled:
                 return
             now = event_loop.time()
             if now - last_call >= delay:
                 last_call = now
-                callback()
+                delay *= callback() or 1.0
             else:
                 scheduled = True
                 event_loop.call_at(last_call + delay, call_at_callback)
@@ -2265,10 +2268,28 @@ class SingletonTask:
 
     def __call__(self, task):
         """"Schedule new task and cancel current one if any
+
+        Returns boolean flag indicating if previous task has completed
+        before this one was scheduled.
         """
         if self.task is not None:
+            result = self.task.done()
             self.task.cancel()
-        self.task = asyncio.ensure_future(task, loop=self.loop)
+        else:
+            result = True
+        if not self.loop.is_closed():
+            self.task = asyncio.ensure_future(task, loop=self.loop)
+            self.task.add_done_callback(self._done_callback)
+        return result
+
+    def _done_callback(self, task):
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            et, eo, tb = sys.exc_info()
+            traceback.print_tb(tb, file=sys.stderr)
 
     def __enter__(self):
         return self
@@ -2332,12 +2353,19 @@ async def select(
     face_match = theme.match
 
     def item_to_text(item):
-        if isinstance(item.haystack, Candidate):
-            return item.haystack.with_positions(item.positions).to_text(theme)
+        """How to convert ranked item to text"""
+        if isinstance(item, RankResult):
+            if isinstance(item.haystack, Candidate):
+                return item.haystack.with_positions(item.positions).to_text(theme)
+            else:
+                return Text(item.haystack).mark_mask(face_match, item.positions)
+        elif isinstance(item, Candidate):
+            return item.to_text(theme)
         else:
-            return Text(item.haystack).mark_mask(face_match, item.positions)
+            return Text(item)
 
     def suffix(count, time):
+        """Text which is rendered as suffix of the input"""
         return reduce(
             op.add,
             (
@@ -2351,18 +2379,22 @@ async def select(
             ),
         )
 
-    async def table_update_coro():
+    async def rank_coro():
+        """Ranking / table update coroutine"""
         niddle = input.input
         # rank
         start = time.time()
-        result = await rank(
-            scorer.scorer,
-            niddle,
-            candidates,
-            loop=loop,
-            executor=executor,
-            keep_order=keep_order,
-        )
+        if niddle:
+            result = await rank(
+                scorer.scorer,
+                niddle,
+                candidates,
+                loop=loop,
+                executor=executor,
+                keep_order=keep_order,
+            )
+        else:
+            result = candidates.candidates
         stop = time.time()
         # set suffix
         input.set_suffix(suffix(len(result), stop - start))
@@ -2370,11 +2402,16 @@ async def select(
         render()
 
     @rate_limit_callback(5.0, loop=loop)
-    def table_update():
-        table_update_task(table_update_coro())
+    def rank_request():
+        """Schedule rank request"""
+        if not rank_singleton(rank_coro()):
+            return 2.0  # increase delay if current ranking was canceled
+        else:
+            return 0.8  # decrease delay if ranking was fast
 
     @rate_limit_callback(30.0, loop=loop)
     def render():
+        """Render single frame"""
         # clean screen down
         tty.cursor_to(line, column)
         tty.write("\x1b[00m")
@@ -2404,11 +2441,11 @@ async def select(
         input.set_suffix(suffix(0, 0))
         table = ListWidget(tty, height=height, item_to_text=item_to_text, theme=theme)
 
-        table_update_task = stack.enter_context(SingletonTask())
-        input.update.on(lambda _: (table_update(),))
+        rank_singleton = stack.enter_context(SingletonTask())
+        input.update.on(lambda _: (rank_request(),))
         candidates_update = getattr(candidates, "update", None)
         if candidates_update is not None:
-            candidates_update.on(lambda _: (table_update(),))
+            candidates_update.on(lambda _: (rank_request(),))
 
         tty.autowrap_set(False)
         tty.mouse_set(True)
@@ -2616,7 +2653,13 @@ def main() -> None:
         # debug lable callback
         def debug_label(event):
             label = " ".join(
-                ("", f"event: {event}", f"write_count: {tty.write_count}", "")
+                (
+                    "",
+                    f"event: {event}",
+                    f"write_count: {tty.write_count}",
+                    f"candidates: {len(candidates)}",
+                    "",
+                )
             )
             tty.cursor_to(0, 0)
             Text(label).mark(face_debug_label).render(tty)
@@ -2628,35 +2671,41 @@ def main() -> None:
     else:
         debug_label = lambda _: False
 
-    decoder = Candidate.line_decoder(delimiter=options.delimiter, predicate=options.nth)
-    if options.sync or sys.stdin.isatty():
-        candidates = []
-        while True:
-            chunk = os.read(sys.stdin.fileno(), 4096)
-            if not chunk:
-                candidates.extend(decoder(None))
-                break
-            candidates.extend(decoder(chunk))
-        if options.reversed:
-            candidates = candidates[::-1]
-    else:
-        candidates = CandidatesAsync(
-            sys.stdin, decoder, reversed=options.reversed, loop=loop
-        )
-
     with ExitStack() as stack:
-
+        # correctly close event loop
         @stack.callback
         def _():
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
-        executor = stack.enter_context(ProcessPoolExecutor(max_workers=5))
+        # instantiate process pool
+        executor = stack.enter_context(ProcessPoolExecutor())
+        # load candidates
+        decoder = Candidate.line_decoder(
+            delimiter=options.delimiter, predicate=options.nth
+        )
+        if options.sync or sys.stdin.isatty():
+            candidates = []
+            while True:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+                if not chunk:
+                    candidates.extend(decoder(None))
+                    break
+                candidates.extend(decoder(chunk))
+            if options.reversed:
+                candidates = candidates[::-1]
+        else:
+            candidates = stack.enter_context(
+                CandidatesAsync(
+                    sys.stdin, decoder, reversed=options.reversed, loop=loop
+                )
+            )
+        # create tty client
         tty = stack.enter_context(
             TTY(file=options.tty_device, loop=loop, color_depth=options.color_depth)
         )
         tty.events.on(debug_label)
-
+        # run selector
         selected = loop.run_until_complete(
             select(
                 candidates,

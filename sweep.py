@@ -1131,7 +1131,7 @@ class TTY:
             partial(self.loop.remove_writer, self.fd),
         )
         encode = codecs.getencoder("utf-8")
-        while True:
+        while not self.closed:
             if not self.write_queue:
                 yield wait_queue
                 continue
@@ -2059,6 +2059,8 @@ class ListWidget:
 # Select
 # ------------------------------------------------------------------------------
 class Candidate(tuple):
+    __slots__ = tuple()
+
     def __new__(cls, fields, positions=None):
         return tuple.__new__(cls, (fields, positions))
 
@@ -2269,9 +2271,12 @@ def rate_limit_callback(max_frequency, loop=None):
 
 
 class SingletonTask:
+    __slots__ = ("loop", "task", "closed")
+
     def __init__(self, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.task = None
+        self.closed = False
 
     def __call__(self, task):
         """"Schedule new task and cancel current one if any
@@ -2284,25 +2289,28 @@ class SingletonTask:
             self.task.cancel()
         else:
             result = True
-        if not self.loop.is_closed():
+        if not self.closed and not self.loop.is_closed():
             self.task = asyncio.ensure_future(task, loop=self.loop)
             self.task.add_done_callback(self._done_callback)
+        else:
+            task.close()
         return result
 
     def _done_callback(self, task):
-        if task.cancelled():
-            return
-        try:
-            task.result()
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
 
     def __enter__(self):
         return self
 
     def __exit__(self, et, eo, tb):
-        if self.task is not None:
-            self.task.cancel()
+        self.closed = True
+        task, self.task = self.task, None
+        if task is not None:
+            task.cancel()
 
 
 class ScorerToggler:
@@ -2431,7 +2439,7 @@ async def select(
 
     with ExitStack() as stack:
         tty = tty or stack.enter_context(TTY(loop=loop))
-        executor = executor or stack.enter_context(ProcessPoolExecutor(max_workers=5))
+        executor = executor or stack.enter_context(ProcessPoolExecutor())
 
         prefix = reduce(
             op.add,
@@ -2681,7 +2689,6 @@ def main() -> None:
         def _():
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
-
         # instantiate process pool
         executor = stack.enter_context(ProcessPoolExecutor())
         # load candidates

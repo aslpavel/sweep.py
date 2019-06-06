@@ -2172,7 +2172,7 @@ class CandidatesAsync:
     """Candidates that are asynchronously loaded from provided file
     """
 
-    __slots__ = ("candidates", "loop", "decoder", "fd", "update", "reversed",)
+    __slots__ = ("candidates", "loop", "decoder", "fd", "update", "reversed")
 
     def __init__(self, file, decoder, reversed=False, loop=None):
         self.loop = loop or asyncio.get_event_loop()
@@ -2640,7 +2640,9 @@ def main() -> None:
         if options.reversed:
             candidates = candidates[::-1]
     else:
-        candidates = CandidatesAsync(sys.stdin, decoder, reversed=options.reversed, loop=loop)
+        candidates = CandidatesAsync(
+            sys.stdin, decoder, reversed=options.reversed, loop=loop
+        )
 
     with ExitStack() as stack:
 

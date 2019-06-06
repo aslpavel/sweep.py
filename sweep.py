@@ -532,6 +532,27 @@ class Event:
         return future
 
 
+class EventAlways:
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self, event):
+        raise ValueError("EventAlways can not be raise")
+
+    def on(self, handler):
+        handler(self.value)
+        return self
+
+    def on_once(self, handler):
+        return self.on(handler)
+
+    def __await__(self):
+        future = asyncio.Future()
+        self.on_once(future.set_result)
+        return future
+
 # ------------------------------------------------------------------------------
 # Matchers
 # ------------------------------------------------------------------------------
@@ -679,7 +700,16 @@ def substr_scorer(niddle, haystack):
 SCORER_DEFAULT = "fuzzy"
 SCORERS = {"fuzzy": fuzzy_scorer, "substr": substr_scorer}
 
-RankResult = namedtuple("RankResult", ("score", "index", "haystack", "positions"))
+
+class RankResult(namedtuple("RankResult", ("score", "index", "haystack", "positions"))):
+    __slots__ = tuple()
+
+    def to_text(self, theme=None):
+        theme = theme or THEME_DEFAULT
+        if isinstance(self.haystack, Candidate):
+            return self.haystack.with_positions(self.positions).to_text(theme)
+        else:
+            return Text(self.haystack).mark_mask(theme.match, self.positions)
 
 
 def _rank_task(scorer, niddle, haystack, offset, keep_order):
@@ -2173,11 +2203,14 @@ class Candidate(tuple):
         return Candidate, tuple(self)
 
 
-class CandidatesAsync:
-    """Candidates that are asynchronously loaded from provided file
+class Loader:
+    """Asynchronous loader
+
+    Asynchronously loads contentent from provided file, notifications can be recieved
+    by subscribing to `Loader::update`.
     """
 
-    __slots__ = ("candidates", "loop", "decoder", "fd", "update", "reversed")
+    __slots__ = ("items", "loop", "decoder", "fd", "update", "reversed")
 
     def __init__(self, file, decoder, reversed=False, loop=None):
         self.loop = loop or asyncio.get_event_loop()
@@ -2185,40 +2218,44 @@ class CandidatesAsync:
         self.reversed = reversed
         self.fd = file if isinstance(file, int) else file.fileno()
 
-        self.candidates = []
+        self.items = []
         self.update = Event()
         os.set_blocking(self.fd, False)
         self.loop.add_reader(self.fd, self._try_read)
 
     def _try_read(self):
-        while True:
-            try:
-                chunk = os.read(self.fd, 4096)
-                if not chunk:
-                    self.close()
-                    return
-            except BlockingIOError:
-                break
-            else:
-                self.extend(self.decoder(chunk))
-                self.update(False)
+        try:
+            while True:
+                try:
+                    chunk = os.read(self.fd, 4096)
+                    if not chunk:
+                        self.close()
+                        return
+                except BlockingIOError:
+                    break
+                else:
+                    self.extend(self.decoder(chunk))
+                    self.update(False)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.close()
 
     def __len__(self):
-        return len(self.candidates)
+        return len(self.items)
 
     def __getitem__(self, selector):
-        return self.candidates[selector]
+        return self.items[selector]
 
     def __bool__(self):
-        return bool(self.candidates)
+        return bool(self.items)
 
     def __iter__(self):
-        return iter(self.candidates)
+        return iter(self.items)
 
-    def extend(self, candidates):
+    def extend(self, items):
         if self.reversed:
-            self.candidates, candidates = candidates[::-1], self.candidates
-        self.candidates.extend(candidates)
+            self.items, items = items[::-1], self.items
+        self.items.extend(items)
 
     def close(self):
         if self.fd is not None:
@@ -2226,7 +2263,8 @@ class CandidatesAsync:
             self.loop.remove_reader(fd)
             os.set_blocking(fd, True)
             self.extend(self.decoder(None))
-            self.update(True)
+            update, self.update = self.update, EventAlways(True)
+            update(True)
 
     def __enter__(self):
         return self
@@ -2354,7 +2392,7 @@ async def select(
 ):
     """Show text UI to select candidate
 
-    Candidates can be `List[str | Candidate] | CandidatesAsync`
+    Candidates can be `List[str | Candidate] | Loader[Candidate]`
     """
     prompt = prompt or "input"
     height = height or 10
@@ -2364,14 +2402,6 @@ async def select(
 
     face_base_fg = theme.base_fg
     face_base_bg = theme.base_bg
-    face_match = theme.match
-
-    def item_to_text(item):
-        """How to convert ranked item to text"""
-        if isinstance(item.haystack, Candidate):
-            return item.haystack.with_positions(item.positions).to_text(theme)
-        else:
-            return Text(item.haystack).mark_mask(face_match, item.positions)
 
     def suffix(count, time):
         """Text which is rendered as suffix of the input"""
@@ -2451,7 +2481,7 @@ async def select(
         input = InputWidget(tty, theme=theme)
         input.set_prefix(prefix)
         input.set_suffix(suffix(0, 0))
-        table = ListWidget(tty, height=height, item_to_text=item_to_text, theme=theme)
+        table = ListWidget(tty, height=height, item_to_text=lambda i: i.to_text(theme), theme=theme)
 
         rank_singleton = stack.enter_context(SingletonTask())
         input.update.on(lambda _: (rank_request(),))
@@ -2689,6 +2719,7 @@ def main() -> None:
         def _():
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
+
         # instantiate process pool
         executor = stack.enter_context(ProcessPoolExecutor())
         # load candidates
@@ -2707,9 +2738,7 @@ def main() -> None:
                 candidates = candidates[::-1]
         else:
             candidates = stack.enter_context(
-                CandidatesAsync(
-                    sys.stdin, decoder, reversed=options.reversed, loop=loop
-                )
+                Loader(sys.stdin, decoder, reversed=options.reversed, loop=loop)
             )
         # create tty client
         tty = stack.enter_context(

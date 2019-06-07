@@ -860,7 +860,9 @@ def p_tty():
     add("\x1b[5~", key("pageup"))
     add("\x1b[6~", key("pagedown"))
     add("\x1b[H", key("home"))
+    add("\x1b[1~", key("home"))
     add("\x1b[F", key("end"))
+    add("\x1b[4~", key("end"))
 
     # arrows
     add("\x1b[A", key("up"))

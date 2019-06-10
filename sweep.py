@@ -2530,6 +2530,8 @@ async def select(
                     elif name == "s":
                         scorer.next()
                         input.notify()
+                elif name == "esc":
+                    break
             if any((type == TTY_SIZE, input(event), table(event))):
                 render()
 

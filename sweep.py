@@ -24,7 +24,7 @@ from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
-from typing import Iterable
+from typing import Iterable, Optional, Callable, List
 
 # ------------------------------------------------------------------------------
 # Utils
@@ -553,6 +553,7 @@ class EventAlways:
         self.on_once(future.set_result)
         return future
 
+
 # ------------------------------------------------------------------------------
 # Matchers
 # ------------------------------------------------------------------------------
@@ -718,9 +719,9 @@ def _rank_task(scorer, niddle, haystack, offset, keep_order):
         score, positions = scorer(niddle, str(item))
         if positions is None:
             continue
-        result.append(RankResult(-score, index + offset, item, positions))
+        result.append(RankResult(score, index + offset, item, positions))
     if not keep_order:
-        result.sort()
+        result.sort(reverse=True)  # from higher score to lower
     return result
 
 
@@ -745,7 +746,8 @@ async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop
         loop=loop,
     )
     if not keep_order:
-        results = list(heapq.merge(*batches))
+        # from higher score to lower
+        results = list(heapq.merge(*batches, reverse=True))
     else:
         results = [item for batch in batches for item in batch]
     return results
@@ -966,7 +968,7 @@ class TTYParser:
         self._parse = p_tty()
         self._parse(None)
 
-    def __call__(self, chunk: bytes) -> Iterable[TTYEvent]:
+    def __call__(self, chunk: Optional[bytes]) -> Iterable[TTYEvent]:
         keys = []
         while True:
             for index, byte in enumerate(chunk):
@@ -2121,7 +2123,9 @@ class Candidate(tuple):
         )
 
     @classmethod
-    def line_decoder(cls, delimiter=None, predicate=None):
+    def line_decoder(
+        cls, delimiter=None, predicate=None
+    ) -> Callable[[Optional[bytes]], List["Candidate"]]:
         """Create line decoder object.
 
         Line decoder splits incoming chunks into lines and converts them
@@ -2470,8 +2474,21 @@ async def select(
         tty.flush()
 
     with ExitStack() as stack:
-        tty = tty or stack.enter_context(TTY(loop=loop))
         executor = executor or stack.enter_context(ProcessPoolExecutor())
+
+        tty = tty or stack.enter_context(TTY(loop=loop))
+        tty.autowrap_set(False)
+        tty.mouse_set(True)
+        # reserve space (force scroll)
+        tty.write("\n" * height)
+        tty.cursor_up(height)
+        tty.flush()
+        line, column = await tty.cursor_cpr()
+
+        table = ListWidget(
+            tty, height=height, item_to_text=lambda i: i.to_text(theme), theme=theme
+        )
+        rank_singleton = stack.enter_context(SingletonTask())
 
         prefix = reduce(
             op.add,
@@ -2483,24 +2500,12 @@ async def select(
         input = InputWidget(tty, theme=theme)
         input.set_prefix(prefix)
         input.set_suffix(suffix(0, 0))
-        table = ListWidget(tty, height=height, item_to_text=lambda i: i.to_text(theme), theme=theme)
-
-        rank_singleton = stack.enter_context(SingletonTask())
         input.update.on(lambda _: (rank_request(),))
+        input.update("")  # force table update
+
         candidates_update = getattr(candidates, "update", None)
         if candidates_update is not None:
             candidates_update.on(lambda _: (rank_request(),))
-
-        tty.autowrap_set(False)
-        tty.mouse_set(True)
-
-        # reserve space (force scroll)
-        tty.write("\n" * table.height)
-        tty.cursor_up(table.height)
-        tty.flush()
-
-        line, column = await tty.cursor_cpr()
-        input.update("")  # force table update
 
         result = -1
         async for event in tty:

@@ -24,12 +24,14 @@ from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
-from typing import Iterable, Optional, Callable, List
+from typing import Iterable, Optional, Callable, List, TypeVar
 
 # ------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------
-def apply(fn, *args, **kwargs):
+T = TypeVar('T')
+
+def apply(fn: Callable[..., T], *args, **kwargs) -> T:
     return fn(*args, **kwargs)
 
 
@@ -502,56 +504,184 @@ def cont_from_future(future):
     return cont_from_future
 
 
-class Event:
-    __slots__ = ("handlers",)
-
-    def __init__(self):
-        self.handlers = []
-
+# ------------------------------------------------------------------------------
+# Events
+# ------------------------------------------------------------------------------
+class EventBase:
     def __call__(self, event):
-        handlers, self.handlers = self.handlers, []
-        for handler in handlers:
-            if handler(event):
-                self.handlers.append(handler)
+        raise NotImplementedError()
 
     def on(self, handler):
-        self.handlers.append(handler)
-        return self
+        """Subscribe handler to event
+
+        If handler returns True it will keep received events untill it returns false.
+        """
+        raise NotImplementedError()
+
+    def __call__(self, event):
+        """Raise provided event"""
+        raise NotImplementedError()
 
     def on_once(self, handler):
+        """Subsribe handler to recieve just one event"""
         def handler_once(event):
             handler(event)
             return False
 
-        self.handlers.append(handler_once)
-        return self
+        return self.on(handler_once)
 
     def __await__(self):
+        """Await for next event"""
         future = asyncio.Future()
         self.on_once(future.set_result)
-        return future
+        yield from future
+
+    def __aiter__(self):
+        return EventIterator(self)
 
 
-class EventAlways:
-    __slots__ = ("value",)
+class EventIterator:
+    """Asynchronous iterator created by EventBase::__aiter__"""
+    __slots__ = ("queue", "event")
+
+    def __init__(self, event):
+        self.event = event
+        self.queue = deque()
+
+        @self.event.on
+        def _process_item(item):
+            self.queue.append(item)
+            return True
+
+    async def __anext__(self):
+        while not self.queue:
+            await self.event
+        item = self.queue.popleft()
+        if item is None:
+            raise StopAsyncIteration()
+        return item
+
+
+class Event(EventBase):
+    __slots__ = ("_handlers",)
+
+    def __init__(self):
+        self._handlers = []
+
+    def __call__(self, event):
+        handlers, self._handlers = self._handlers, []
+        for handler in handlers:
+            if handler(event):
+                self._handlers.append(handler)
+
+    def on(self, handler):
+        self._handlers.append(handler)
+        return handler
+
+
+class EventBuffered(EventBase):
+    """This implementation of even ensures that at least on handler handled event
+    """
+
+    __slots__ = ("_handlers", "_queue")
+
+    def __init__(self):
+        self._handlers = []
+        self._queue = deque()
+        self._handling_events = False
+
+    def __call__(self, event):
+        self._queue.append(event)
+        self._handle_events()
+
+    def on(self, handler):
+        self._handlers.append(handler)
+        self._handle_events()
+        return handler
+
+    def _handle_events(self):
+        if self._handling_events:
+            return
+        try:
+            self._handling_evens = True
+            while self._queue and self._handlers:
+                event = self._queue.popleft()
+                handlers, self._handlers = self._handlers, []
+                for handler in handlers:
+                    if handler(event):
+                        self._handlers.append(handler)
+        finally:
+            self._hanlding_events = False
+
+
+class EventFramed(EventBuffered):
+    """Create buffered frame reader from file and decoder
+
+    Once stream is stopped (either by `stop` method or by processing all input)
+    it will fire `None` event. Nothing is read from the stream untill `start` is
+    called or contexed entered.
+
+    Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
+    last chunk, and decoder must flush all remaining content.
+    """
+    __slots__ = ("fd", "decoder", "loop", "running")
+
+    def __init__(self, file, decoder, loop=None):
+        super().__init__()
+        self.loop = loop or asyncio.get_event_loop()
+        self.decoder = decoder
+        self.fd = file if isinstance(file, int) else file.fileno()
+        self.running = False
+
+    def start(self):
+        running, self.running = self.running, True
+        if running:
+            return
+        os.set_blocking(self.fd, False)
+        self.loop.add_reader(self.fd, self._read_callback)
+
+    def stop(self):
+        running, self.running = self.running, False
+        if not running:
+            return
+        self.loop.remove_reader(self.fd)
+        os.set_blocking(self.fd, True)
+        self(None)  # indicate last event
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, et, eo, tb):
+        self.stop()
+
+    def _read_callback(self):
+        try:
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                for frame in self.decoder(None):
+                    self(frame)
+                self.stop()
+                return
+        except BlockingIOError:
+            pass
+        else:
+            for frame in self.decoder(chunk):
+                self(frame)
+
+
+class EventAlways(EventBase):
+    __slots__ = ("_value",)
 
     def __init__(self, value):
-        self.value = value
+        self._value = value
 
     def __call__(self, event):
         raise ValueError("EventAlways can not be raise")
 
     def on(self, handler):
-        handler(self.value)
+        handler(self._value)
         return self
-
-    def on_once(self, handler):
-        return self.on(handler)
-
-    def __await__(self):
-        future = asyncio.Future()
-        self.on_once(future.set_result)
-        return future
 
 
 # ------------------------------------------------------------------------------
@@ -961,7 +1091,7 @@ def p_tty():
     return Pattern.choice(patterns)
 
 
-class TTYParser:
+class TTYDecoder:
     __slots__ = ("_parse",)
 
     def __init__(self) -> None:
@@ -1101,8 +1231,8 @@ class TTY:
             self.loop.add_signal_handler(signal.SIGWINCH, resize_handler)
 
             # reader
-            parser = TTYParser()
-            self.loop.add_reader(self.fd, partial(self._try_read, parser))
+            decoder = TTYDecoder()
+            self.loop.add_reader(self.fd, partial(self._try_read, decoder))
 
             # writer
             cont_run(self._writer(), name="TTY._writer")

@@ -29,7 +29,8 @@ from typing import Iterable, Optional, Callable, List, TypeVar
 # ------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------
-T = TypeVar('T')
+T = TypeVar("T")
+
 
 def apply(fn: Callable[..., T], *args, **kwargs) -> T:
     return fn(*args, **kwargs)
@@ -524,6 +525,7 @@ class EventBase:
 
     def on_once(self, handler):
         """Subsribe handler to recieve just one event"""
+
         def handler_once(event):
             handler(event)
             return False
@@ -542,6 +544,7 @@ class EventBase:
 
 class EventIterator:
     """Asynchronous iterator created by EventBase::__aiter__"""
+
     __slots__ = ("queue", "event")
 
     def __init__(self, event):
@@ -624,6 +627,7 @@ class EventFramed(EventBuffered):
     Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
     last chunk, and decoder must flush all remaining content.
     """
+
     __slots__ = ("fd", "decoder", "loop", "running")
 
     def __init__(self, file, decoder, loop=None):
@@ -685,7 +689,7 @@ class EventAlways(EventBase):
 
 
 # ------------------------------------------------------------------------------
-# Matchers
+# Scorers
 # ------------------------------------------------------------------------------
 @apply
 def _fuzzy_scorer():
@@ -1134,6 +1138,7 @@ class TTY:
     """
 
     __slots__ = (
+        "file",
         "fd",
         "size",
         "loop",
@@ -1163,9 +1168,10 @@ class TTY:
 
     def __init__(self, *, file=None, loop=None, color_depth=None):
         if isinstance(file, int):
-            self.fd = file
+            self.file = file
         else:
-            self.fd = os.open(file or self.DEFAULT_FILE, os.O_RDWR)
+            self.file = open(file or self.DEFAULT_FILE, "w+b", buffering=0)
+        self.fd = self.file.fileno()
         assert os.isatty(self.fd), f"file must be a tty: {file}"
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
@@ -1173,12 +1179,14 @@ class TTY:
         self.size = TTYSize(0, 0)
 
         def events_queue_handler(event):
+            if event is None:
+                return False
             type, _ = event
             if type != TTY_CPR:
                 self.events_queue.put_nowait(event)
             return True  # keep subscribed
 
-        self.events = Event()
+        self.events = EventFramed(self.file, TTYDecoder(), loop=loop)
         self.events_queue = asyncio.Queue()
         self.events.on(events_queue_handler)
 
@@ -1231,8 +1239,7 @@ class TTY:
             self.loop.add_signal_handler(signal.SIGWINCH, resize_handler)
 
             # reader
-            decoder = TTYDecoder()
-            self.loop.add_reader(self.fd, partial(self._try_read, decoder))
+            self.events.start()
 
             # writer
             cont_run(self._writer(), name="TTY._writer")
@@ -1250,23 +1257,12 @@ class TTY:
             self.write_sync(self.EPILOGUE)
             # unregister descriptor
             os.set_blocking(self.fd, True)
+            # flush and stop writer
             self.write_event(None)
-            self.loop.remove_reader(self.fd)
             self.loop.remove_writer(self.fd)
-            os.close(self.fd)
-
-    def _try_read(self, parser):
-        try:
-            chunk = os.read(self.fd, 1024)
-            if not chunk:
-                return False  # unsubsribe
-        except BlockingIOError:
-            pass
-        else:
-            events = parser(chunk)
-            for event in events:
-                self.events(event)
-        return True  # keep subscrbied
+            # stop reader
+            self.events.stop()
+            self.file.close()
 
     def write_sync(self, data: bytes) -> bool:
         blocked = False
@@ -1281,6 +1277,7 @@ class TTY:
         self.write_buffer.write(input)
 
     def flush(self) -> None:
+        """Flush current buffer to write_queue"""
         frame = self.write_buffer.getvalue()
         self.write_buffer.truncate(0)
         self.write_buffer.seek(0)
@@ -2209,9 +2206,9 @@ class ListWidget:
         width = self.tty.size.width
         for face, left, text, right in self.layout:
             face.render(tty)
+            tty.erase_line()  # will fill with current color
             left.render(tty, face)
             text.render(tty, face)
-            tty.erase_line()  # will fill with current color
             tty.cursor_to_column(width)
             right.render(tty)
             tty.cursor_to_column(0)
@@ -2593,7 +2590,6 @@ async def select(
         # clean screen down
         tty.cursor_to(line, column)
         tty.write("\x1b[00m")
-        tty.erase_down()
         # show table
         tty.cursor_to(line + 1, column)
         table.render()

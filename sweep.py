@@ -510,18 +510,15 @@ def cont_from_future(future):
 # ------------------------------------------------------------------------------
 class EventBase:
     def __call__(self, event):
-        raise NotImplementedError()
+        """Raise provided event"""
+        raise NotImplementedError("This event does support raising events")
 
     def on(self, handler):
         """Subscribe handler to event
 
         If handler returns True it will keep received events untill it returns false.
         """
-        raise NotImplementedError()
-
-    def __call__(self, event):
-        """Raise provided event"""
-        raise NotImplementedError()
+        raise NotImplementedError("This event does not support subscribing")
 
     def on_once(self, handler):
         """Subsribe handler to recieve just one event"""
@@ -576,6 +573,7 @@ class Event(EventBase):
         for handler in handlers:
             if handler(event):
                 self._handlers.append(handler)
+        return self
 
     def on(self, handler):
         self._handlers.append(handler)
@@ -596,6 +594,7 @@ class EventBuffered(EventBase):
     def __call__(self, event):
         self._queue.append(event)
         self._handle_events()
+        return self
 
     def on(self, handler):
         self._handlers.append(handler)
@@ -617,7 +616,7 @@ class EventBuffered(EventBase):
             self._hanlding_events = False
 
 
-class EventFramed(EventBuffered):
+class EventFramed(EventBase):
     """Create buffered frame reader from file and decoder
 
     Once stream is stopped (either by `stop` method or by processing all input)
@@ -628,14 +627,19 @@ class EventFramed(EventBuffered):
     last chunk, and decoder must flush all remaining content.
     """
 
-    __slots__ = ("fd", "decoder", "loop", "running")
+    __slots__ = ("fd", "decoder", "loop", "running", "buffered")
 
     def __init__(self, file, decoder, loop=None):
         super().__init__()
         self.loop = loop or asyncio.get_event_loop()
-        self.decoder = decoder
         self.fd = file if isinstance(file, int) else file.fileno()
+        self.decoder = decoder
+        self.buffered = EventBuffered()
         self.running = False
+
+    def on(self, handler):
+        self.buffered.on(handler)
+        return handler
 
     def start(self):
         running, self.running = self.running, True
@@ -650,7 +654,7 @@ class EventFramed(EventBuffered):
             return
         self.loop.remove_reader(self.fd)
         os.set_blocking(self.fd, True)
-        self(None)  # indicate last event
+        self.buffered(None)  # indicate last event
 
     def __enter__(self):
         self.start()
@@ -664,24 +668,27 @@ class EventFramed(EventBuffered):
             chunk = os.read(self.fd, 4096)
             if not chunk:
                 for frame in self.decoder(None):
-                    self(frame)
+                    self.buffered(frame)
                 self.stop()
                 return
         except BlockingIOError:
             pass
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            self.close()
         else:
             for frame in self.decoder(chunk):
-                self(frame)
+                self.buffered(frame)
 
 
-class EventAlways(EventBase):
+class EventDone(EventBase):
     __slots__ = ("_value",)
 
     def __init__(self, value):
         self._value = value
 
     def __call__(self, event):
-        raise ValueError("EventAlways can not be raise")
+        raise ValueError("EventDone can not be raise")
 
     def on(self, handler):
         handler(self._value)
@@ -864,6 +871,7 @@ async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop
     """
     loop = loop or asyncio.get_event_loop()
     batch_size = 4096
+    haystack = haystack if isinstance(haystack, list) else list(haystack)
     batches = await asyncio.gather(
         *(
             loop.run_in_executor(
@@ -1178,6 +1186,11 @@ class TTY:
         self.color_depth = color_depth
         self.size = TTYSize(0, 0)
 
+        # reading
+        self.events = EventFramed(self.file, TTYDecoder(), loop=loop)
+        self.events_queue = asyncio.Queue()
+
+        @self.events.on
         def events_queue_handler(event):
             if event is None:
                 return False
@@ -1186,15 +1199,13 @@ class TTY:
                 self.events_queue.put_nowait(event)
             return True  # keep subscribed
 
-        self.events = EventFramed(self.file, TTYDecoder(), loop=loop)
-        self.events_queue = asyncio.Queue()
-        self.events.on(events_queue_handler)
-
+        # wiring
         self.write_buffer = io.StringIO()
         self.write_event = Event()
         self.write_queue = deque()
         self.write_count = 0
 
+        # closing
         self.closed = False
         self.closed_event = Event()
         cont_run(self._closer(), name="TTY._closer")
@@ -1233,7 +1244,7 @@ class TTY:
                 else:
                     size = TTYSize(buf[0], buf[1])
                 self.size = size
-                self.events(TTYEvent(TTY_SIZE, size))
+                self.events_queue.put_nowait(TTYEvent(TTY_SIZE, size))
 
             resize_handler()
             self.loop.add_signal_handler(signal.SIGWINCH, resize_handler)
@@ -1415,17 +1426,19 @@ class TTY:
     async def cursor_cpr(self):
         """Current cursor possition
         """
+        cpr = self.loop.create_future()
 
+        @self.events.on
         def cpr_handler(event):
+            if event is None:
+                cpr.set_exception(RuntimeError("tty is closed"))
+                return False
             type, attrs = event
             if type != TTY_CPR:
                 return True
             else:
                 cpr.set_result(attrs)
                 return False
-
-        cpr = self.loop.create_future()
-        self.events.on(cpr_handler)
 
         self.write_sync(b"\x1b[6n")
         return await cpr
@@ -2343,41 +2356,24 @@ class Loader:
     by subscribing to `Loader::update`.
     """
 
-    __slots__ = ("items", "loop", "decoder", "fd", "update", "reversed")
+    __slots__ = ("items", "update")
 
     def __init__(self, file, decoder, reversed=False, loop=None):
-        self.loop = loop or asyncio.get_event_loop()
-        self.decoder = decoder
-        self.reversed = reversed
-        self.fd = file if isinstance(file, int) else file.fileno()
+        self.update = EventFramed(file, decoder, loop)
+        self.items = deque()
 
-        self.items = []
-        self.update = Event()
-        os.set_blocking(self.fd, False)
-        self.loop.add_reader(self.fd, self._try_read)
-
-    def _try_read(self):
-        try:
-            while True:
-                try:
-                    chunk = os.read(self.fd, 4096)
-                    if not chunk:
-                        self.close()
-                        return
-                except BlockingIOError:
-                    break
-                else:
-                    self.extend(self.decoder(chunk))
-                    self.update(False)
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
-            self.close()
+        @self.update.on
+        def updat_items(item):
+            if item is None:
+                return False
+            if reversed:
+                self.items.appendleft(item)
+            else:
+                self.items.append(item)
+            return True
 
     def __len__(self):
         return len(self.items)
-
-    def __getitem__(self, selector):
-        return self.items[selector]
 
     def __bool__(self):
         return bool(self.items)
@@ -2385,25 +2381,15 @@ class Loader:
     def __iter__(self):
         return iter(self.items)
 
-    def extend(self, items):
-        if self.reversed:
-            self.items, items = items[::-1], self.items
-        self.items.extend(items)
-
-    def close(self):
-        if self.fd is not None:
-            fd, self.fd = self.fd, None
-            self.loop.remove_reader(fd)
-            os.set_blocking(fd, True)
-            self.extend(self.decoder(None))
-            update, self.update = self.update, EventAlways(True)
-            update(True)
+    def __getitem__(self, index):
+        return self.items[index]
 
     def __enter__(self):
+        self.update.start()
         return self
 
     def __exit__(self, et, eo, tb):
-        self.close()
+        self.update.stop()
 
 
 def rate_limit_callback(max_frequency, loop=None):

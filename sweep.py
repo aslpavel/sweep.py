@@ -553,6 +553,9 @@ class EventIterator:
             self.queue.append(item)
             return True
 
+    def __aiter__(self):
+        return self
+
     async def __anext__(self):
         while not self.queue:
             await self.event
@@ -626,7 +629,6 @@ class EventFramed(EventBase):
     Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
     last chunk, and decoder must flush all remaining content.
     """
-
     __slots__ = ("fd", "decoder", "loop", "running", "buffered")
 
     def __init__(self, file, decoder, loop=None):
@@ -675,7 +677,7 @@ class EventFramed(EventBase):
             pass
         except Exception:
             traceback.print_exc(file=sys.stderr)
-            self.close()
+            self.stop()
         else:
             for frame in self.decoder(chunk):
                 self.buffered(frame)

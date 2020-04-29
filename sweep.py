@@ -8,6 +8,7 @@ import fcntl
 import heapq
 import io
 import itertools as it
+import math
 import operator as op
 import os
 import re
@@ -102,6 +103,8 @@ class Pattern:
         return alive, results, unconsumed
 
     def __call__(self):
+        """Create parse function
+        """
         pattern = self
         if self.epsilons:
             pattern = self.optimize()
@@ -110,7 +113,14 @@ class Pattern:
 
         STATE_START, STATE_FAIL = self.STATE_START, self.STATE_FAIL
 
-        def parse(input):
+        def parse(input: Optional[int]) -> (bool, List[bytearray], bytearray):
+            """Accepts byte value, and returns current state of the matcher
+
+            Returns state, is a tuple of three elements:
+               - boolean indicating if matcher is alive
+               - list containing results of the match
+               - bytearray that contains unconsumed part
+            """
             nonlocal state, results, buffer, consumed
 
             if input is None:
@@ -629,6 +639,7 @@ class EventFramed(EventBase):
     Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
     last chunk, and decoder must flush all remaining content.
     """
+
     __slots__ = ("fd", "decoder", "loop", "running", "buffered")
 
     def __init__(self, file, decoder, loop=None):
@@ -906,6 +917,8 @@ TTY_CPR = 2
 TTY_SIZE = 3
 TTY_CLOSE = 4
 TTY_MOUSE = 5
+TTY_SIZE_PIXELS = 6
+TTY_SIZE_CELLS = 7
 
 KEY_MODE_SHIFT = 0b001
 KEY_MODE_ALT = 0b010
@@ -967,6 +980,12 @@ class TTYEvent(tuple):
             return "Mouse({} at line={} column={})".format(
                 "-".join(names), line, column
             )
+        elif type == TTY_SIZE_CELLS:
+            height, width = attrs
+            return f"SizeCells(height={height}, width={width})"
+        elif type == TTY_SIZE_PIXELS:
+            height, width = attrs
+            return f"SizePixels(height={height}, width={width})"
 
 
 @apply
@@ -1015,6 +1034,10 @@ def p_tty():
     add("\x1b[B", key("down"))
     add("\x1b[C", key("right"))
     add("\x1b[D", key("left"))
+    add("\x1b[1;2A", key("up", KEY_MODE_SHIFT))
+    add("\x1b[1;2B", key("down", KEY_MODE_SHIFT))
+    add("\x1b[1;2C", key("right", KEY_MODE_SHIFT))
+    add("\x1b[1;2D", key("left", KEY_MODE_SHIFT))
     add("\x1b[1;9A", key("up", KEY_MODE_ALT))
     add("\x1b[1;9B", key("donw", KEY_MODE_ALT))
     add("\x1b[1;9C", key("right", KEY_MODE_ALT))
@@ -1038,15 +1061,33 @@ def p_tty():
     add("\x1d", key("]", KEY_MODE_CTRL))
 
     # CPR (current position report)
-    def extract_cpr(buf):
-        line, column = (int(v) for v in buf[2:-1].decode().split(";"))
-        return TTYEvent(TTY_CPR, (line, column))
-
     add(
         Pattern.sequence(
             (p_string("\x1b["), p_number, p_string(";"), p_number, p_string("R"))
         ),
-        extract_cpr,
+        lambda buf: TTYEvent(
+            TTY_CPR, tuple((int(v) for v in buf[2:-1].decode().split(";")))
+        ),
+    )
+
+    # size of the terminal
+    add(
+        # answer to "\x1b[14t"
+        Pattern.sequence(
+            (p_string("\x1b[4;"), p_number, p_string(";"), p_number, p_string("t"))
+        ),
+        lambda buf: TTYEvent(
+            TTY_SIZE_PIXELS, tuple((int(v) for v in buf[4:-1].decode().split(";")))
+        ),
+    )
+    add(
+        # answer to "\x1b[18t"
+        Pattern.sequence(
+            (p_string("\x1b[8;"), p_number, p_string(";"), p_number, p_string("t"))
+        ),
+        lambda buf: TTYEvent(
+            TTY_SIZE_CELLS, tuple((int(v) for v in buf[4:-1].decode().split(";")))
+        ),
     )
 
     # Mouse
@@ -1102,7 +1143,7 @@ def p_tty():
     # chars
     add(p_utf8, lambda buf: TTYEvent(TTY_CHAR, buf.decode()))
 
-    return Pattern.choice(patterns)
+    return Pattern.choice(patterns).optimize()
 
 
 class TTYDecoder:
@@ -1113,7 +1154,13 @@ class TTYDecoder:
         self._parse(None)
 
     def __call__(self, chunk: Optional[bytes]) -> Iterable[TTYEvent]:
-        keys = []
+        """Consumes bytes and returns a list of parsed keys
+        """
+        keys: List[TTYEvent] = []
+        if chunk is None:
+            self._parse(None)
+            return keys
+
         while True:
             for index, byte in enumerate(chunk):
                 alive, results, unconsumed = self._parse(byte)
@@ -1170,6 +1217,8 @@ class TTY:
         b"\x1b[?1003l"
         b"\x1b[?1006l"
         b"\x1b[?1000l"
+        # disable alternative screen (broken on some terminals, cursor is moved to (1,1))
+        # b"\x1b[?1049l"
         # visible cursor
         b"\x1b[?25h"
         # reset color settings
@@ -1445,6 +1494,40 @@ class TTY:
         self.write_sync(b"\x1b[6n")
         return await cpr
 
+    async def size_in_pixels(self):
+        future = self.loop.create_future()
+
+        @self.events.on
+        def size_handler(event):
+            if event is None:
+                future.set_exceptio(RuntimeError("tty is closed"))
+                return False
+            type, attrs = event
+            if type != TTY_SIZE_PIXELS:
+                return True
+            else:
+                future.set_result(attrs)
+
+        self.write_sync(b"\x1b[14t")
+        return await asyncio.wait_for(future, 0.1, loop=self.loop)
+
+    async def size_in_cells(self):
+        future = self.loop.create_future()
+
+        @self.events.on
+        def size_handler(event):
+            if event is None:
+                future.set_exceptio(RuntimeError("tty is closed"))
+                return False
+            type, attrs = event
+            if type != TTY_SIZE_CELLS:
+                return True
+            else:
+                future.set_result(attrs)
+
+        self.write_sync(b"\x1b[18t")
+        return await asyncio.wait_for(future, 0.1, loop=self.loop)
+
     def erase_line(self) -> None:
         self.write("\x1b[K")
 
@@ -1455,6 +1538,18 @@ class TTY:
 # ------------------------------------------------------------------------------
 # Text
 # ------------------------------------------------------------------------------
+def color_srgb_to_linear(value):
+    if value <= 0.04045:
+        return value / 12.92
+    return math.pow((value + 0.055) / 1.055, 2.4)
+
+
+def color_linear_to_srgb(value):
+    if value <= 0.0031308:
+        return value * 12.92
+    return math.pow(value, 1 / 2.4) * 1.055 - 0.055
+
+
 COLOR_DEPTH_24 = 1
 COLOR_DEPTH_8 = 2
 COLOR_DEPTH_4 = 3
@@ -1465,7 +1560,7 @@ else:
 
 
 class Color(tuple):
-    __slots__ = tuple()
+    __slots__: List[str] = []
     HEX_PATTERN = re.compile(
         "^#?"
         "([0-9a-fA-F]{2})"  # red
@@ -1506,6 +1601,28 @@ class Color(tuple):
         lambda self: sum(c * p for c, p in zip(self, (0.2126, 0.7152, 0.0722)))
     )
 
+    def linear(self):
+        r, g, b, a = self
+        return Color(
+            (
+                color_srgb_to_linear(r),
+                color_srgb_to_linear(g),
+                color_srgb_to_linear(b),
+                a,
+            )
+        )
+
+    def srgb(self):
+        r, g, b, a = self
+        return Color(
+            (
+                color_linear_to_srgb(r),
+                color_linear_to_srgb(g),
+                color_linear_to_srgb(b),
+                a,
+            )
+        )
+
     def hex(self):
         r, g, b, a = self
         return "#{:02x}{:02x}{:02x}{}".format(
@@ -1515,18 +1632,19 @@ class Color(tuple):
             f"{int(a * 255):02x}" if a != 1 else "",
         )
 
-    def overlay(self, other):
+    def overlay(self, other, linear=True):
         """Overlay other color over current color
         """
         if other is None:
             return self
-        r0, g0, b0, a0 = self
-        r1, g1, b1, a1 = other
-        a01 = (1 - a1) * a0 + a1
-        r01 = ((1 - a1) * a0 * r0 + a1 * r1) / a01
-        g01 = ((1 - a1) * a0 * g0 + a1 * g1) / a01
-        b01 = ((1 - a1) * a0 * b0 + a1 * b1) / a01
-        return Color((r01, g01, b01, a01))
+        r0, g0, b0, a0 = self.linear() if linear else self
+        r1, g1, b1, a1 = other.linear() if linear else other
+        a01 = a1 + a0 * (1 - a1)
+        r01 = (r1 * a1 + r0 * a0 * (1 - a1)) / a01
+        g01 = (g1 * a1 + g0 * a0 * (1 - a1)) / a01
+        b01 = (b1 * a1 + b0 * a0 * (1 - a1)) / a01
+        result = Color((r01, g01, b01, a01))
+        return result.srgb() if linear else result
 
     def with_alpha(self, alpha):
         return Color((*self[:3], alpha))
@@ -1635,15 +1753,15 @@ class Face(tuple):
     bg = property(lambda self: self[1])
     attrs = property(lambda self: self[2])
 
-    def overlay(self, other):
+    def overlay(self, other, linear=True):
         face = FACE_OVERLAY_CACHE.get((self, other))
         if face is None:
             fg0, bg0, attrs0 = self
             fg1, bg1, attrs1 = other
-            bg01 = bg1 if bg0 is None else bg0.overlay(bg1)
-            fg01 = fg1 if fg0 is None else fg0.overlay(fg1)
+            bg01 = bg1 if bg0 is None else bg0.overlay(bg1, linear)
+            fg01 = fg1 if fg0 is None else fg0.overlay(fg1, linear)
             if fg01 is not None:
-                fg01 = fg01 if bg01 is None else bg01.overlay(fg01)
+                fg01 = fg01 if bg01 is None else bg01.overlay(fg01, linear)
             face = Face(fg01, bg01, attrs0 | attrs1)
             FACE_OVERLAY_CACHE[(self, other)] = face
         return face
@@ -1956,25 +2074,25 @@ class Text:
 # ------------------------------------------------------------------------------
 def Theme(base, match, fg, bg):
     base = Color(base)
-    match = base.with_alpha(0.35) if match is None else Color(match)
+    match = base.with_alpha(0.5) if match is None else Color(match)
     fg = Color(fg)
     bg = Color(bg)
     theme_dict = {
         "base_bg": Face(bg=base).with_fg_contrast(fg, bg),
         "base_fg": Face(fg=base, bg=bg),
         "base_bg_1": Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
-        "base_fg_1": Face,
         "match": Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
         "input_default": Face(fg=fg, bg=bg),
         "list_dot": Face(fg=base),
         "list_selected": Face(
-            fg=bg.overlay(fg.with_alpha(0.9)), bg=bg.overlay(fg.with_alpha(0.055))
+            fg=bg.overlay(fg.with_alpha(0.9)),
+            bg=bg.overlay(fg.with_alpha(0.1), linear=False),
         ),
         "list_default": Face(fg=bg.overlay(fg.with_alpha(0.9)), bg=bg),
         "list_scrollbar_on": Face(bg=base.with_alpha(0.8)),
-        "list_scrollbar_off": Face(bg=base.with_alpha(0.4)),
+        "list_scrollbar_off": Face(bg=base.with_alpha(0.5)),
         "candidate_active": Face(fg=bg.overlay(fg.with_alpha(0.9))),
-        "candidate_inactive": Face(fg=bg.overlay(fg.with_alpha(0.4))),
+        "candidate_inactive": Face(fg=bg.overlay(fg.with_alpha(0.5))),
     }
     return type("Theme", tuple(), theme_dict)()
 
@@ -2868,6 +2986,7 @@ def main() -> None:
             TTY(file=options.tty_device, loop=loop, color_depth=options.color_depth)
         )
         tty.events.on(debug_label)
+
         # run selector
         selected = loop.run_until_complete(
             select(

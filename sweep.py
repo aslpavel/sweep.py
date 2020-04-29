@@ -1553,7 +1553,9 @@ def color_linear_to_srgb(value):
 COLOR_DEPTH_24 = 1
 COLOR_DEPTH_8 = 2
 COLOR_DEPTH_4 = 3
-if os.environ.get("COLORTERM") in ("truecolor", "24bit"):
+if os.environ.get("TERM") in {"linux", "dumb"}:
+    COLOR_DEPTH_DEFAULT = COLOR_DEPTH_4
+elif os.environ.get("COLORTERM") in ("truecolor", "24bit"):
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_24
 else:
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_8
@@ -2072,34 +2074,68 @@ class Text:
 # ------------------------------------------------------------------------------
 # Widgets
 # ------------------------------------------------------------------------------
-def Theme(base, match, fg, bg):
-    base = Color(base)
-    match = base.with_alpha(0.5) if match is None else Color(match)
-    fg = Color(fg)
-    bg = Color(bg)
-    theme_dict = {
-        "base_bg": Face(bg=base).with_fg_contrast(fg, bg),
-        "base_fg": Face(fg=base, bg=bg),
-        "base_bg_1": Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
-        "match": Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
-        "input_default": Face(fg=fg, bg=bg),
-        "list_dot": Face(fg=base),
-        "list_selected": Face(
-            fg=bg.overlay(fg.with_alpha(0.9)),
-            bg=bg.overlay(fg.with_alpha(0.1), linear=False),
-        ),
-        "list_default": Face(fg=bg.overlay(fg.with_alpha(0.9)), bg=bg),
-        "list_scrollbar_on": Face(bg=base.with_alpha(0.8)),
-        "list_scrollbar_off": Face(bg=base.with_alpha(0.5)),
-        "candidate_active": Face(fg=bg.overlay(fg.with_alpha(0.9))),
-        "candidate_inactive": Face(fg=bg.overlay(fg.with_alpha(0.5))),
-    }
-    return type("Theme", tuple(), theme_dict)()
+class Theme:
+    __slots__ = ("attrs",)
+
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+    def __getattr__(self, name: str) -> Face:
+        attr = self.attrs.get(name)
+        if attr is None:
+            raise AttributeError(f"Theme does not have '{name}' attribute")
+        return attr
+
+    @classmethod
+    def from_palette(cls, base, match, fg, bg):
+        base = Color(base)
+        match = base.with_alpha(0.5) if match is None else Color(match)
+        fg = Color(fg)
+        bg = Color(bg)
+        attrs = {
+            "base_bg": Face(bg=base).with_fg_contrast(fg, bg),
+            "base_fg": Face(fg=base, bg=bg),
+            "match": Face(bg=bg.overlay(match)).with_fg_contrast(fg, bg),
+            "input_default": Face(fg=fg, bg=bg),
+            "list_dot": Face(fg=base),
+            "list_selected": Face(
+                fg=bg.overlay(fg.with_alpha(0.9)),
+                bg=bg.overlay(fg.with_alpha(0.1), linear=False),
+            ),
+            "list_default": Face(fg=bg.overlay(fg.with_alpha(0.9)), bg=bg),
+            "list_scrollbar_on": Face(bg=base.with_alpha(0.8)),
+            "list_scrollbar_off": Face(bg=base.with_alpha(0.5)),
+            "candidate_active": Face(fg=bg.overlay(fg.with_alpha(0.9))),
+            "candidate_inactive": Face(fg=bg.overlay(fg.with_alpha(0.4), linear=False)),
+            "symbol_selected": "\u25cf",   # ●
+            "symbol_sep_left": "\ue0b2",   # 
+            "symbol_sep_right": "\ue0b0",  # 
+        }
+        return cls(attrs)
 
 
 THEME_LIGHT_ATTRS = dict(base="#8f3f71", match=None, fg="#3c3836", bg="#fbf1c7")
 THEME_DARK_ATTRS = dict(base="#d3869b", match=None, fg="#ebdbb2", bg="#282828")
-THEME_DEFAULT = Theme(**THEME_DARK_ATTRS)
+THEME_BASIC = Theme(dict(
+    base_bg=Face(attrs=FACE_REVERSE),
+    base_fg=Face(),
+    match=Face(attrs=FACE_REVERSE),
+    input_default=Face(),
+    list_dot=Face(),
+    list_selected=Face(),
+    list_default=Face(),
+    list_scrollbar_on=Face(attrs=FACE_REVERSE),
+    list_scrollbar_off=Face(),
+    candidate_active=Face(),
+    candidate_inactive=Face(fg=Color("#808080")),
+    symbol_selected="=>",
+    symbol_sep_left="",
+    symbol_sep_right="",
+))
+if COLOR_DEPTH_DEFAULT == COLOR_DEPTH_4:
+    THEME_DEFAULT = THEME_BASIC
+else:
+    THEME_DEFAULT = Theme.from_palette(**THEME_DARK_ATTRS)
 
 
 class InputWidget:
@@ -2297,9 +2333,9 @@ class ListWidget:
                 text = self.item_to_text(self.items[self.offset + index])
                 for chunk_index, chunk in enumerate(text.chunk(width - 4)):
                     if self.cursor == index and chunk_index == 0:
-                        left_margin = Text(" \u25cf ").mark(theme.list_dot)
+                        left_margin = Text(f" {theme.symbol_selected} ").mark(theme.list_dot)
                     else:
-                        left_margin = Text("   ")
+                        left_margin = Text(" " * (len(theme.symbol_selected) + 2))
                     layout.append([face, left_margin, chunk])
                     line_index += 1
                 index += 1
@@ -2647,7 +2683,7 @@ async def select(
         return reduce(
             op.add,
             (
-                Text(" \ue0b2").mark(face_base_fg),
+                Text(f" {theme.symbol_sep_left}").mark(face_base_fg),
                 Text(f" {count}/{len(candidates)} {time:.2f}s").mark(face_base_bg),
                 Text(
                     " [{}{}]".format(
@@ -2726,7 +2762,7 @@ async def select(
             op.add,
             (
                 Text(f" {prompt} ").mark(face_base_bg.overlay(Face(attrs=FACE_BOLD))),
-                Text("\ue0b0 ").mark(face_base_fg),
+                Text(f"{theme.symbol_sep_right} ").mark(face_base_fg),
             ),
         )
         input = InputWidget(tty, theme=theme)
@@ -2834,12 +2870,16 @@ def main_options():
         return scorer
 
     def parse_theme(argument):
+        if THEME_DEFAULT is THEME_BASIC:
+            return THEME_BASIC
         attrs = dict(THEME_DARK_ATTRS)
         for attr in argument.lower().split(","):
             if attr == "light":
                 attrs.update(THEME_LIGHT_ATTRS)
             elif attr == "dark":
                 attrs.update(THEME_DARK_ATTRS)
+            elif attr == "basic":
+                return THEME_BASIC
             else:
                 key, value = attr.split("=")
                 value = value.strip("\"'")
@@ -2847,7 +2887,7 @@ def main_options():
                     attrs[key] = None
                 else:
                     attrs[key] = value
-        return Theme(**attrs)
+        return Theme.from_palette(**attrs)
 
     def parse_height(argument):
         try:

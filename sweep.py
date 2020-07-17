@@ -1555,7 +1555,7 @@ COLOR_DEPTH_8 = 2
 COLOR_DEPTH_4 = 3
 if os.environ.get("TERM") in {"linux", "dumb"}:
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_4
-elif os.environ.get("COLORTERM") in ("truecolor", "24bit"):
+elif os.environ.get("COLORTERM") in {"truecolor", "24bit"}:
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_24
 else:
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_8
@@ -2801,6 +2801,9 @@ async def select(
                 elif name == "esc":
                     break
             if any((type == TTY_SIZE, input(event), table(event))):
+                tty.cursor_to(line, column)
+                tty.write("\x1b[00m")
+                tty.erase_down()
                 render()
 
         tty.cursor_to(line, column)
@@ -2953,7 +2956,8 @@ def main_options():
     parser.add_argument(
         "--sync", action="store_true", help="block on reading full input"
     )
-    return parser.parse_args()
+    args, _unknown = parser.parse_known_args()
+    return args
 
 
 def main() -> None:

@@ -29,10 +29,12 @@ from functools import partial, reduce
 from typing import (
     Any,
     Deque,
+    Dict,
     Generator,
     Generic,
     Iterable,
     Iterator,
+    NamedTuple,
     Optional,
     Callable,
     List,
@@ -57,7 +59,7 @@ def const(value: T) -> Callable[[Any], T]:
 
 
 def debug(fn: Callable[..., T]) -> Callable[..., T]:
-    def fn_debug(*args, **kwargs):
+    def fn_debug(*args: Any, **kwargs: Any) -> T:
         try:
             return fn(*args, **kwargs)
         except Exception as error:
@@ -74,12 +76,12 @@ def debug(fn: Callable[..., T]) -> Callable[..., T]:
 def thunk(fn: Callable[..., T]) -> Callable[..., T]:
     """Decorate function, it will be executed only once"""
 
-    def fn_thunk(*args, **kwargs):
+    def fn_thunk(*args: Any, **kwargs: Any):
         if not cell:
             cell.append(fn(*args, **kwargs))
         return cell[0]
 
-    cell = []
+    cell: List[T] = []
     return fn_thunk
 
 
@@ -98,11 +100,11 @@ class Pattern:
             -1 <= s <= len(table) for s in finals
         ), f"invalid final state found: {finals}"
 
-        self.table = table
+        self.table: List[Dict[int, int]] = table
         self.finals = finals
         self.epsilons = epsilons or {}
 
-    def check(self, string):
+    def check(self, string: str | bytes):
         if not string:
             return
         if isinstance(string, str):
@@ -384,7 +386,12 @@ def p_string(bs: bytes | str) -> Pattern:
 # ------------------------------------------------------------------------------
 # Coroutine
 # ------------------------------------------------------------------------------
-def coro(fn):
+R = TypeVar("R")
+ExcInfo = Tuple[Any, Any, Any]  # sys.exc_info
+Cont = Callable[[Callable[[R], T], Callable[[ExcInfo], T]], T]
+
+
+def coro(fn: Callable[..., Generator]) -> Callable[..., Cont[R, T]]:
     """Create lite double barrel continuation from generator
 
     - continuation type is `ContT r a = ((a -> r), (e -> r)) -> r`
@@ -392,25 +399,27 @@ def coro(fn):
     - coro(fn) will return continuation
     """
 
-    def coro_fn(*args, **kwargs):
-        def cont_fn(on_done, on_error):
-            def coro_next(ticket, is_error, result=None):
+    def coro_fn(*args: Any, **kwargs: Any) -> Cont[R, T]:
+        def cont_fn(on_done: Callable[[R], T], on_error: Callable[[ExcInfo], T]) -> T:
+            def coro_next(
+                ticket: int,
+                is_error: bool,
+                result: Optional[ExcInfo | R] = None,
+            ) -> T:
                 nonlocal gen_ticket
                 if gen_ticket != ticket:
-                    warnings.warn(
+                    raise RuntimeError(
                         f"coro_next called with incorrect ticket: "
                         f"{ticket} != {gen_ticket} "
                         f"[{fn}(*{args}, **{kwargs})]",
-                        RuntimeWarning,
                     )
-                    return
                 gen_ticket += 1
 
                 try:
                     cont = gen.throw(*result) if is_error else gen.send(result)
                 except StopIteration as ret:
                     gen.close()
-                    return on_done(ret.args[0] if ret.args else None)
+                    return on_done(ret.value)
                 except Exception:
                     gen.close()
                     return on_error(sys.exc_info())
@@ -432,10 +441,10 @@ def coro(fn):
     return coro_fn
 
 
-def cont(in_done, in_error=None):
+def cont(in_done, in_error=None) -> Cont[R, None]:
     """Create continuation from (done, error) pair"""
 
-    def cont(out_done, out_error):
+    def cont(out_done: Callable[[R], T], out_error: Callable[[ExcInfo], T]) -> None:
         def safe_out_done(result=None):
             return out_done(result)
 
@@ -591,7 +600,7 @@ class Event(EventBase[T]):
     def __init__(self):
         self._handlers = []
 
-    def __call__(self, event) -> Event[T]:
+    def __call__(self, event: T) -> Event[T]:
         handlers, self._handlers = self._handlers, []
         for handler in handlers:
             if handler(event):
@@ -643,7 +652,7 @@ class EventFramed(EventBase[T]):
 
     Once stream is stopped (either by `stop` method or by processing all input)
     it will fire `None` event. Nothing is read from the stream until `start` is
-    called or contexed entered.
+    called or context entered.
 
     Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
     last chunk, and decoder must flush all remaining content.
@@ -653,7 +662,7 @@ class EventFramed(EventBase[T]):
 
     def __init__(self, file, decoder, loop=None):
         super().__init__()
-        self.loop = loop or asyncio.get_event_loop()
+        self.loop = loop or asyncio.get_running_loop()
         self.fd: int = file if isinstance(file, int) else file.fileno()
         self.decoder = decoder
         self.buffered = EventBuffered()
@@ -867,8 +876,11 @@ SCORER_DEFAULT = "fuzzy"
 SCORERS = {"fuzzy": fuzzy_scorer, "substr": substr_scorer}
 
 
-class RankResult(namedtuple("RankResult", ("score", "index", "haystack", "positions"))):
-    __slots__ = tuple()
+class RankResult(NamedTuple):
+    score: float
+    index: int
+    haystack: str
+    positions: Optional[List[int]]
 
     def to_text(self, theme=None):
         theme = theme or THEME_DEFAULT
@@ -878,7 +890,13 @@ class RankResult(namedtuple("RankResult", ("score", "index", "haystack", "positi
             return Text(self.haystack).mark_mask(theme.match, self.positions)
 
 
-def _rank_task(scorer, needle, haystack, offset, keep_order):
+def _rank_task(
+    scorer: Scorer,
+    needle: str,
+    haystack: List[str],
+    offset,
+    keep_order: bool,
+) -> List[RankResult]:
     result = []
     for index, item in enumerate(haystack):
         score, positions = scorer(needle, str(item))
@@ -890,9 +908,17 @@ def _rank_task(scorer, needle, haystack, offset, keep_order):
     return result
 
 
-async def rank(scorer, needle, haystack, *, keep_order=None, executor=None, loop=None):
+async def rank(
+    scorer: Scorer,
+    needle: str,
+    haystack: List[str],
+    *,
+    keep_order: Optional[bool] = None,
+    executor=None,
+    loop=None,
+):
     """Score haystack against needle in executor and return sorted result"""
-    loop = loop or asyncio.get_event_loop()
+    loop = loop or asyncio.get_running_loop()
     batch_size = 4096
     haystack = haystack if isinstance(haystack, list) else list(haystack)
     batches = await asyncio.gather(
@@ -1242,7 +1268,7 @@ class TTY:
             self.fd = self.file.fileno()
         assert os.isatty(self.fd), f"file must be a tty: {file}"
 
-        self.loop = asyncio.get_event_loop() if loop is None else loop
+        self.loop = asyncio.get_running_loop() if loop is None else loop
         self.color_depth = color_depth
         self.size = TTYSize(0, 0)
 
@@ -2153,7 +2179,7 @@ class InputWidget:
     ):
         self.prefix = Text("")
         self.suffix = Text("")
-        self.update = Event()
+        self.update = Event[str]()
         self.tty = tty
         self.theme = theme or THEME_DEFAULT
         self.set(buffer, cursor)
@@ -2588,7 +2614,7 @@ def rate_limit_callback(max_frequency, loop=None):
 
         scheduled = False
         last_call = 0
-        event_loop = loop or asyncio.get_event_loop()
+        event_loop = loop or asyncio.get_running_loop()
         return rate_limited_callback
 
     delay = 1.0 / max_frequency
@@ -2599,7 +2625,7 @@ class SingletonTask:
     __slots__ = ("loop", "task", "closed")
 
     def __init__(self, loop=None):
-        self.loop = loop or asyncio.get_event_loop()
+        self.loop = loop or asyncio.get_running_loop()
         self.task = None
         self.closed = False
 
@@ -2684,7 +2710,7 @@ async def select(
     prompt = prompt or "input"
     height = height or 10
     theme = theme or THEME_DEFAULT
-    loop = loop or asyncio.get_event_loop()
+    loop = loop or asyncio.get_running_loop()
     scorer = ScorerToggler(scorer or SCORERS[SCORER_DEFAULT])
 
     face_base_fg = theme.base_fg
@@ -2833,7 +2859,7 @@ def main_options():
     import argparse
     import textwrap
 
-    def parse_nth(argument):
+    def parse_nth(argument) -> Callable[[int], bool]:
         def predicate(low: Optional[int], high: Optional[int]) -> Callable[[int], bool]:
             if low is not None and high is not None:
                 return lambda index: low <= index <= high
@@ -2865,7 +2891,7 @@ def main_options():
 
         return lambda index: any(predicate(index) for predicate in predicates)
 
-    def parse_color_depth(argument):
+    def parse_color_depth(argument: str) -> int:
         depths = {"24": COLOR_DEPTH_24, "8": COLOR_DEPTH_8, "4": COLOR_DEPTH_4}
         depth = depths.get(argument)
         if depth is None:
@@ -2874,7 +2900,7 @@ def main_options():
             )
         return depth
 
-    def parse_scorer(argument):
+    def parse_scorer(argument: str) -> Scorer:
         scorer = SCORERS.get(argument)
         if scorer is None:
             raise argparse.ArgumentTypeError(
@@ -2882,7 +2908,7 @@ def main_options():
             )
         return scorer
 
-    def parse_theme(argument):
+    def parse_theme(argument: str) -> Theme:
         if THEME_DEFAULT is THEME_BASIC:
             return THEME_BASIC
         attrs = dict(THEME_DARK_ATTRS)
@@ -2902,7 +2928,7 @@ def main_options():
                     attrs[key] = value
         return Theme.from_palette(**attrs)
 
-    def parse_height(argument):
+    def parse_height(argument: str) -> int:
         try:
             height = int(argument)
             if height <= 0:
@@ -2979,7 +3005,8 @@ def main() -> None:
 
         asyncio.set_event_loop(asyncio.SelectorEventLoop(selectors.SelectSelector()))
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     if options.debug:
         # enable asyncio debugging
         import logging
@@ -2987,7 +3014,7 @@ def main() -> None:
         loop.set_debug(True)
         logging.getLogger("asyncio").setLevel(logging.INFO)
 
-        # debug lable callback
+        # debug label callback
         def debug_label(event):
             label = " ".join(
                 (

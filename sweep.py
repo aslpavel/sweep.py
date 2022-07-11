@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sweep is a command line fuzzy finer (fzf analog)
 """
+from __future__ import annotations
 import array
 import asyncio
 import codecs
@@ -25,7 +26,21 @@ from collections import namedtuple, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
-from typing import Iterable, Optional, Callable, List, TypeVar
+from typing import (
+    Any,
+    Deque,
+    Generator,
+    Generic,
+    Iterable,
+    Iterator,
+    Optional,
+    Callable,
+    List,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
 # ------------------------------------------------------------------------------
 # Utils
@@ -33,15 +48,15 @@ from typing import Iterable, Optional, Callable, List, TypeVar
 T = TypeVar("T")
 
 
-def apply(fn: Callable[..., T], *args, **kwargs) -> T:
+def apply(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return fn(*args, **kwargs)
 
 
-def const(value):
+def const(value: T) -> Callable[[Any], T]:
     return lambda _: value
 
 
-def debug(fn):
+def debug(fn: Callable[..., T]) -> Callable[..., T]:
     def fn_debug(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -56,9 +71,8 @@ def debug(fn):
     return fn_debug
 
 
-def thunk(fn):
-    """Decorate function, it will be executed only once
-    """
+def thunk(fn: Callable[..., T]) -> Callable[..., T]:
+    """Decorate function, it will be executed only once"""
 
     def fn_thunk(*args, **kwargs):
         if not cell:
@@ -103,8 +117,7 @@ class Pattern:
         return alive, results, unconsumed
 
     def __call__(self):
-        """Create parse function
-        """
+        """Create parse function"""
         pattern = self
         if self.epsilons:
             pattern = self.optimize()
@@ -113,7 +126,7 @@ class Pattern:
 
         STATE_START, STATE_FAIL = self.STATE_START, self.STATE_FAIL
 
-        def parse(input: Optional[int]) -> (bool, List[bytearray], bytearray):
+        def parse(input: Optional[int]) -> Tuple[bool, List[bytearray], bytearray]:
             """Accepts byte value, and returns current state of the matcher
 
             Returns state, is a tuple of three elements:
@@ -156,14 +169,13 @@ class Pattern:
 
         return parse
 
-    def map(self, fn):
-        """Replace mappers for finals (not sequencable after this)
-        """
+    def map(self, fn) -> Pattern:
+        """Replace mappers for finals (can not use `sequence` after this)"""
         table, _, (finals,), epsilons = self._merge((self,))
         return Pattern(table, {f: (fn,) for f, _ in finals.items()}, epsilons)
 
     @classmethod
-    def choice(cls, patterns):
+    def choice(cls, patterns: Sequence[Pattern]) -> Pattern:
         assert len(patterns) > 0, "pattern set must be non empyt"
         table, starts, finals, epsilons = cls._merge(patterns, table=[{}])
         epsilons[0] = set(starts)
@@ -171,11 +183,11 @@ class Pattern:
             table, {f: cb for fs in finals for f, cb in fs.items()}, epsilons
         )
 
-    def __or__(self, other):
+    def __or__(self, other: Pattern) -> Pattern:
         return self.choice((self, other))
 
     @classmethod
-    def sequence(cls, patterns):
+    def sequence(cls, patterns: Sequence[Pattern]) -> Pattern:
         assert len(patterns) > 0, "patterns set must be non empyt"
         table, starts, finals, epsilons = cls._merge(patterns)
 
@@ -190,20 +202,20 @@ class Pattern:
     def __add__(self, other):
         return self.sequence((self, other))
 
-    def some(self):
+    def some(self) -> Pattern:
         table, _, (finals,), epsilons = self._merge((self,))
         for final in finals:
             epsilons.setdefault(final, set()).add(0)
         return Pattern(table, finals, epsilons)
 
-    def many(self):
+    def many(self) -> Pattern:
         pattern = self.some()
         for final in pattern.finals:
             pattern.epsilons.setdefault(0, set()).add(final)
         return pattern
 
     @classmethod
-    def _merge(cls, patterns, table=None):
+    def _merge(cls, patterns: Sequence[Pattern], table=None):
         """(Merge|Copy) multiple patterns into single one
 
         Puts all states from all patterns into a single table, and updates
@@ -225,15 +237,13 @@ class Pattern:
 
         return (table, starts, finals, epsilons)
 
-    def optimize(self):
-        """Convert NFA to DFA (eleminate epsilons) using powerset construnction
-        """
+    def optimize(self) -> Pattern:
+        """Convert NFA to DFA (eliminate epsilons) using power-set construction"""
         # NOTE:
         #  - `n_` contains NFA states (indices in table)
-        #  - `d_` constains DFA state (subset of all indices in table)
+        #  - `d_` contains DFA state (subset of all indices in table)
         def epsilon_closure(n_states):
-            """Epsilon closure (reachable with epsilon move) of set of states
-            """
+            """Epsilon closure (reachable with epsilon move) of set of states"""
             d_state = set()
             queue = set(n_states)
             while queue:
@@ -324,17 +334,17 @@ class Pattern:
             return dot
 
 
-def p_byte(b):
+def p_byte(b: int) -> Pattern:
     assert 0 <= b <= 255, f"byte expected: {b}"
     return Pattern([{b: 1}, {}], {1: tuple()})
 
 
-def p_byte_pred(pred):
+def p_byte_pred(pred: Callable[[int], bool]) -> Pattern:
     return Pattern([{b: 1 for b in range(256) if pred(b)}, {}], {1: tuple()})
 
 
 @apply
-def p_utf8():
+def p_utf8() -> Pattern:
     printable_set = set(
         ord(c)
         for c in (string.ascii_letters + string.digits + string.punctuation + " ")
@@ -355,16 +365,16 @@ def p_utf8():
 
 
 @apply
-def p_digit():
+def p_digit() -> Pattern:
     return p_byte_pred(lambda b: ord("0") <= b <= ord("9"))
 
 
 @apply
-def p_number():
+def p_number() -> Pattern:
     return p_digit.some()
 
 
-def p_string(bs):
+def p_string(bs: bytes | str) -> Pattern:
     if isinstance(bs, str):
         bs = bs.encode()
     table = [{b: i + 1} for i, b in enumerate(bs)] + [{}]
@@ -375,7 +385,7 @@ def p_string(bs):
 # Coroutine
 # ------------------------------------------------------------------------------
 def coro(fn):
-    """Create lite double barrel contiuation from generator
+    """Create lite double barrel continuation from generator
 
     - continuation type is `ContT r a = ((a -> r), (e -> r)) -> r`
     - fn must be a generator yielding continuation
@@ -423,8 +433,7 @@ def coro(fn):
 
 
 def cont(in_done, in_error=None):
-    """Create continuation from (done, error) pair
-    """
+    """Create continuation from (done, error) pair"""
 
     def cont(out_done, out_error):
         def safe_out_done(result=None):
@@ -466,8 +475,7 @@ def cont_run(cont, on_done=None, on_error=None, name=None):
 
 
 def cont_any(*conts):
-    """Create continuatino which is equal to first completed continuation
-    """
+    """Create continuation which is equal to first completed continuation"""
 
     def cont_any(out_done, out_error):
         @thunk
@@ -500,8 +508,7 @@ def cont_finally(cont, callback):
 
 
 def cont_from_future(future):
-    """Create continuation from `Future` object
-    """
+    """Create continuation from `Future` object"""
 
     def cont_from_future(out_done, out_error):
         def done_callback(future):
@@ -518,20 +525,23 @@ def cont_from_future(future):
 # ------------------------------------------------------------------------------
 # Events
 # ------------------------------------------------------------------------------
-class EventBase:
-    def __call__(self, event):
+Handler = Callable[[T], bool]
+
+
+class EventBase(Generic[T]):
+    def __call__(self, event: T) -> EventBase[T]:
         """Raise provided event"""
         raise NotImplementedError("This event does support raising events")
 
-    def on(self, handler):
+    def on(self, handler: Handler[T]) -> Handler[T]:
         """Subscribe handler to event
 
-        If handler returns True it will keep received events untill it returns false.
+        If handler returns True it will keep received events until it returns false.
         """
         raise NotImplementedError("This event does not support subscribing")
 
-    def on_once(self, handler):
-        """Subsribe handler to recieve just one event"""
+    def on_once(self, handler: Handler[T]) -> Handler[T]:
+        """Subscribe handler to receive just one event"""
 
         def handler_once(event):
             handler(event)
@@ -539,11 +549,11 @@ class EventBase:
 
         return self.on(handler_once)
 
-    def __await__(self):
+    def __await__(self) -> Generator[Any, None, T]:
         """Await for next event"""
-        future = asyncio.Future()
+        future: asyncio.Future[T] = asyncio.get_running_loop().create_future()
         self.on_once(future.set_result)
-        yield from future
+        return future.__await__()
 
     def __aiter__(self):
         return EventIterator(self)
@@ -575,46 +585,45 @@ class EventIterator:
         return item
 
 
-class Event(EventBase):
+class Event(EventBase[T]):
     __slots__ = ("_handlers",)
 
     def __init__(self):
         self._handlers = []
 
-    def __call__(self, event):
+    def __call__(self, event) -> Event[T]:
         handlers, self._handlers = self._handlers, []
         for handler in handlers:
             if handler(event):
                 self._handlers.append(handler)
         return self
 
-    def on(self, handler):
+    def on(self, handler: Handler[T]) -> Handler[T]:
         self._handlers.append(handler)
         return handler
 
 
-class EventBuffered(EventBase):
-    """This implementation of even ensures that at least on handler handled event
-    """
+class EventBuffered(EventBase[T]):
+    """This implementation of even ensures that at least on handler handled event"""
 
     __slots__ = ("_handlers", "_queue")
 
-    def __init__(self):
-        self._handlers = []
-        self._queue = deque()
+    def __init__(self) -> None:
+        self._handlers: List[Handler[T]] = []
+        self._queue: Deque[T] = deque()
         self._handling_events = False
 
-    def __call__(self, event):
+    def __call__(self, event: T) -> EventBase[T]:
         self._queue.append(event)
         self._handle_events()
         return self
 
-    def on(self, handler):
+    def on(self, handler: Handler[T]) -> Handler[T]:
         self._handlers.append(handler)
         self._handle_events()
         return handler
 
-    def _handle_events(self):
+    def _handle_events(self) -> None:
         if self._handling_events:
             return
         try:
@@ -629,11 +638,11 @@ class EventBuffered(EventBase):
             self._hanlding_events = False
 
 
-class EventFramed(EventBase):
+class EventFramed(EventBase[T]):
     """Create buffered frame reader from file and decoder
 
     Once stream is stopped (either by `stop` method or by processing all input)
-    it will fire `None` event. Nothing is read from the stream untill `start` is
+    it will fire `None` event. Nothing is read from the stream until `start` is
     called or contexed entered.
 
     Decoder is a function `Option[bytes] -> List[Frame]`, `None` argument indicates
@@ -645,7 +654,7 @@ class EventFramed(EventBase):
     def __init__(self, file, decoder, loop=None):
         super().__init__()
         self.loop = loop or asyncio.get_event_loop()
-        self.fd = file if isinstance(file, int) else file.fileno()
+        self.fd: int = file if isinstance(file, int) else file.fileno()
         self.decoder = decoder
         self.buffered = EventBuffered()
         self.running = False
@@ -654,14 +663,14 @@ class EventFramed(EventBase):
         self.buffered.on(handler)
         return handler
 
-    def start(self):
+    def start(self) -> None:
         running, self.running = self.running, True
         if running:
             return
         os.set_blocking(self.fd, False)
         self.loop.add_reader(self.fd, self._read_callback)
 
-    def stop(self):
+    def stop(self) -> None:
         running, self.running = self.running, False
         if not running:
             return
@@ -669,12 +678,13 @@ class EventFramed(EventBase):
         os.set_blocking(self.fd, True)
         self.buffered(None)  # indicate last event
 
-    def __enter__(self):
+    def __enter__(self) -> EventFramed[T]:
         self.start()
         return self
 
-    def __exit__(self, et, eo, tb):
+    def __exit__(self, et: Any, eo: Any, tb: Any) -> bool:
         self.stop()
+        return False
 
     def _read_callback(self):
         try:
@@ -694,16 +704,16 @@ class EventFramed(EventBase):
                 self.buffered(frame)
 
 
-class EventDone(EventBase):
+class EventDone(EventBase[T]):
     __slots__ = ("_value",)
 
-    def __init__(self, value):
+    def __init__(self, value: T) -> None:
         self._value = value
 
-    def __call__(self, event):
+    def __call__(self, event: T) -> None:
         raise ValueError("EventDone can not be raise")
 
-    def on(self, handler):
+    def on(self, handler: Callable[[T], bool]) -> EventBase[T]:
         handler(self._value)
         return self
 
@@ -711,6 +721,10 @@ class EventDone(EventBase):
 # ------------------------------------------------------------------------------
 # Scorers
 # ------------------------------------------------------------------------------
+Score = Tuple[float, Optional[List[int]]]
+Scorer = Callable[[str, str], Score]
+
+
 @apply
 def _fuzzy_scorer():
     """Fuzzy matching for `fzy` utility
@@ -747,9 +761,8 @@ def _fuzzy_scorer():
     BONUS_STATES = [{}, BONUS_MAP, lower_with(SCORE_MATCH_CAPITAL, BONUS_MAP)]
     BONUS_INDEX = digit_with(1, lower_with(1, upper_with(2, {})))
 
-    def bonus(haystack):
-        """Additional bonus based on previous char in haystack
-        """
+    def bonus(haystack: str) -> List[float]:
+        """Additional bonus based on previous char in haystack"""
         c_prev = "/"
         bonus = []
         for c in haystack:
@@ -757,36 +770,34 @@ def _fuzzy_scorer():
             c_prev = c
         return bonus
 
-    def subsequence(niddle, haystack):
-        """Check if niddle is subsequence of haystack
-        """
-        niddle, haystack = niddle.lower(), haystack.lower()
-        if not niddle:
-            True
+    def subsequence(needle: str, haystack: str) -> bool:
+        """Check if needle is subsequence of haystack"""
+        needle, haystack = needle.lower(), haystack.lower()
+        if not needle:
+            return True
         offset = 0
-        for char in niddle:
+        for char in needle:
             offset = haystack.find(char, offset) + 1
             if offset <= 0:
                 return False
         return True
 
-    def score(niddle, haystack):
-        """Calculate score, and positions of haystack
-        """
-        n, m = len(niddle), len(haystack)
+    def score(needle: str, haystack: str) -> Score:
+        """Calculate score, and positions of haystack"""
+        n, m = len(needle), len(haystack)
         bonus_score = bonus(haystack)
-        niddle, haystack = niddle.lower(), haystack.lower()
+        needle, haystack = needle.lower(), haystack.lower()
 
         if n == 0 or n == m:
             return SCORE_MAX, list(range(n))
-        D = [[0] * m for _ in range(n)]  # best score ending with `niddle[:i]`
-        M = [[0] * m for _ in range(n)]  # best score for `niddle[:i]`
+        D = [[0.0] * m for _ in range(n)]  # best score ending with `needle[:i]`
+        M = [[0.0] * m for _ in range(n)]  # best score for `needle[:i]`
         for i in range(n):
             prev_score = SCORE_MIN
             gap_score = SCORE_GAP_TRAILING if i == n - 1 else SCORE_GAP_INNER
 
             for j in range(m):
-                if niddle[i] == haystack[j]:
+                if needle[i] == haystack[j]:
                     score = SCORE_MIN
                     if i == 0:
                         score = j * SCORE_GAP_LEADING + bonus_score[j]
@@ -821,31 +832,31 @@ def _fuzzy_scorer():
 
         return M[n - 1][m - 1], position
 
-    def fuzzy_scorer(niddle, haystack):
-        if subsequence(niddle, haystack):
-            return score(niddle, haystack)
+    def fuzzy_scorer(needle: str, haystack: str) -> Score:
+        if subsequence(needle, haystack):
+            return score(needle, haystack)
         else:
             return SCORE_MIN, None
 
     return fuzzy_scorer
 
 
-def fuzzy_scorer(niddle, haystack):
-    return _fuzzy_scorer(niddle, haystack)
+def fuzzy_scorer(needle: str, haystack: str) -> Score:
+    return _fuzzy_scorer(needle, haystack)
 
 
-def substr_scorer(niddle, haystack):
+def substr_scorer(needle: str, haystack: str) -> Score:
     positions, offset = [], 0
-    niddle, haystack = niddle.lower(), haystack.lower()
-    for niddle in niddle.split(" "):
-        if not niddle:
+    needle, haystack = needle.lower(), haystack.lower()
+    for needle in needle.split(" "):
+        if not needle:
             continue
-        offset = haystack.find(niddle, offset)
+        offset = haystack.find(needle, offset)
         if offset < 0:
             return float("-inf"), None
-        niddle_len = len(niddle)
-        positions.extend(range(offset, offset + niddle_len))
-        offset += niddle_len
+        needle_len = len(needle)
+        positions.extend(range(offset, offset + needle_len))
+        offset += needle_len
     if not positions:
         return 0, positions
     match_len = positions[-1] + 1 - positions[0]
@@ -867,10 +878,10 @@ class RankResult(namedtuple("RankResult", ("score", "index", "haystack", "positi
             return Text(self.haystack).mark_mask(theme.match, self.positions)
 
 
-def _rank_task(scorer, niddle, haystack, offset, keep_order):
+def _rank_task(scorer, needle, haystack, offset, keep_order):
     result = []
     for index, item in enumerate(haystack):
-        score, positions = scorer(niddle, str(item))
+        score, positions = scorer(needle, str(item))
         if positions is None:
             continue
         result.append(RankResult(score, index + offset, item, positions))
@@ -879,9 +890,8 @@ def _rank_task(scorer, niddle, haystack, offset, keep_order):
     return result
 
 
-async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop=None):
-    """Score haystack against niddle in execturo and return sorted result
-    """
+async def rank(scorer, needle, haystack, *, keep_order=None, executor=None, loop=None):
+    """Score haystack against needle in executor and return sorted result"""
     loop = loop or asyncio.get_event_loop()
     batch_size = 4096
     haystack = haystack if isinstance(haystack, list) else list(haystack)
@@ -891,14 +901,13 @@ async def rank(scorer, niddle, haystack, *, keep_order=None, executor=None, loop
                 executor,
                 _rank_task,
                 scorer,
-                niddle,
+                needle,
                 haystack[offset : offset + batch_size],
                 offset,
                 keep_order,
             )
             for offset in range(0, len(haystack), batch_size)
         ),
-        loop=loop,
     )
     if not keep_order:
         # from higher score to lower
@@ -1154,8 +1163,7 @@ class TTYDecoder:
         self._parse(None)
 
     def __call__(self, chunk: Optional[bytes]) -> Iterable[TTYEvent]:
-        """Consumes bytes and returns a list of parsed keys
-        """
+        """Consumes bytes and returns a list of parsed keys"""
         keys: List[TTYEvent] = []
         if chunk is None:
             self._parse(None)
@@ -1228,9 +1236,10 @@ class TTY:
     def __init__(self, *, file=None, loop=None, color_depth=None):
         if isinstance(file, int):
             self.file = file
+            self.fd = file
         else:
             self.file = open(file or self.DEFAULT_FILE, "w+b", buffering=0)
-        self.fd = self.file.fileno()
+            self.fd = self.file.fileno()
         assert os.isatty(self.fd), f"file must be a tty: {file}"
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
@@ -1475,8 +1484,7 @@ class TTY:
             self.cursor_forward(-count)
 
     async def cursor_cpr(self):
-        """Current cursor possition
-        """
+        """Current cursor possition"""
         cpr = self.loop.create_future()
 
         @self.events.on
@@ -1500,16 +1508,16 @@ class TTY:
         @self.events.on
         def size_handler(event):
             if event is None:
-                future.set_exceptio(RuntimeError("tty is closed"))
+                future.set_exception(RuntimeError("tty is closed"))
                 return False
             type, attrs = event
             if type != TTY_SIZE_PIXELS:
                 return True
-            else:
-                future.set_result(attrs)
+            future.set_result(attrs)
+            return False
 
         self.write_sync(b"\x1b[14t")
-        return await asyncio.wait_for(future, 0.1, loop=self.loop)
+        return await asyncio.wait_for(future, 0.1)
 
     async def size_in_cells(self):
         future = self.loop.create_future()
@@ -1517,16 +1525,16 @@ class TTY:
         @self.events.on
         def size_handler(event):
             if event is None:
-                future.set_exceptio(RuntimeError("tty is closed"))
+                future.set_exception(RuntimeError("tty is closed"))
                 return False
             type, attrs = event
             if type != TTY_SIZE_CELLS:
                 return True
-            else:
-                future.set_result(attrs)
+            future.set_result(attrs)
+            return False
 
         self.write_sync(b"\x1b[18t")
-        return await asyncio.wait_for(future, 0.1, loop=self.loop)
+        return await asyncio.wait_for(future, 0.1)
 
     def erase_line(self) -> None:
         self.write("\x1b[K")
@@ -1635,8 +1643,7 @@ class Color(tuple):
         )
 
     def overlay(self, other, linear=True):
-        """Overlay other color over current color
-        """
+        """Overlay other color over current color"""
         if other is None:
             return self
         r0, g0, b0, a0 = self.linear() if linear else self
@@ -1656,8 +1663,7 @@ class Color(tuple):
         return f"Color(\x1b[00{fg}{self.sgr(False)}m{self.hex()}\x1b[m)"
 
     def sgr(self, is_fg, depth=None):
-        """Return part of SGR sequence responsible for picking this color
-        """
+        """Return part of SGR sequence responsible for picking this color"""
         depth = depth or COLOR_DEPTH_DEFAULT
         r, g, b, _ = self
 
@@ -1896,8 +1902,7 @@ def p_ansi_text():
 
 
 class Text:
-    """Formated text (string with associated faces)
-    """
+    """Formated text (string with associated faces)"""
 
     __slots__ = ("_chunks", "_len")
 
@@ -2107,8 +2112,8 @@ class Theme:
             "list_scrollbar_off": Face(bg=base.with_alpha(0.5)),
             "candidate_active": Face(fg=bg.overlay(fg.with_alpha(0.9))),
             "candidate_inactive": Face(fg=bg.overlay(fg.with_alpha(0.4), linear=False)),
-            "symbol_selected": "\u25cf",   # ●
-            "symbol_sep_left": "\ue0b2",   # 
+            "symbol_selected": "\u25cf",  # ●
+            "symbol_sep_left": "\ue0b2",  # 
             "symbol_sep_right": "\ue0b0",  # 
         }
         return cls(attrs)
@@ -2116,22 +2121,24 @@ class Theme:
 
 THEME_LIGHT_ATTRS = dict(base="#8f3f71", match=None, fg="#3c3836", bg="#fbf1c7")
 THEME_DARK_ATTRS = dict(base="#d3869b", match=None, fg="#ebdbb2", bg="#282828")
-THEME_BASIC = Theme(dict(
-    base_bg=Face(attrs=FACE_REVERSE),
-    base_fg=Face(),
-    match=Face(attrs=FACE_REVERSE),
-    input_default=Face(),
-    list_dot=Face(),
-    list_selected=Face(),
-    list_default=Face(),
-    list_scrollbar_on=Face(attrs=FACE_REVERSE),
-    list_scrollbar_off=Face(),
-    candidate_active=Face(),
-    candidate_inactive=Face(fg=Color("#808080")),
-    symbol_selected="=>",
-    symbol_sep_left="",
-    symbol_sep_right="",
-))
+THEME_BASIC = Theme(
+    dict(
+        base_bg=Face(attrs=FACE_REVERSE),
+        base_fg=Face(),
+        match=Face(attrs=FACE_REVERSE),
+        input_default=Face(),
+        list_dot=Face(),
+        list_selected=Face(),
+        list_default=Face(),
+        list_scrollbar_on=Face(attrs=FACE_REVERSE),
+        list_scrollbar_off=Face(),
+        candidate_active=Face(),
+        candidate_inactive=Face(fg=Color("#808080")),
+        symbol_selected="=>",
+        symbol_sep_left="",
+        symbol_sep_right="",
+    )
+)
 if COLOR_DEPTH_DEFAULT == COLOR_DEPTH_4:
     THEME_DEFAULT = THEME_BASIC
 else:
@@ -2141,7 +2148,9 @@ else:
 class InputWidget:
     __slots__ = ("buffer", "cursor", "update", "prefix", "suffix", "tty", "theme")
 
-    def __init__(self, tty, theme=None, buffer=None, cursor=None):
+    def __init__(
+        self, tty: TTY, theme: Optional[Theme] = None, buffer=None, cursor=None
+    ):
         self.prefix = Text("")
         self.suffix = Text("")
         self.update = Event()
@@ -2161,7 +2170,7 @@ class InputWidget:
     def input(self):
         return "".join(self.buffer)
 
-    def __call__(self, event):
+    def __call__(self, event: TTYEvent):
         type, attrs = event
         if type == TTY_KEY:
             name, mode = attrs
@@ -2201,7 +2210,7 @@ class InputWidget:
     def set_suffix(self, suffix):
         self.suffix = suffix
 
-    def render(self):
+    def render(self) -> None:
         tty = self.tty
         face = self.theme.input_default
         face.render(tty)
@@ -2227,7 +2236,9 @@ class ListWidget:
         "theme",
     )
 
-    def __init__(self, tty, items=None, height=None, item_to_text=None, theme=None):
+    def __init__(
+        self, tty: TTY, items=None, height=None, item_to_text=None, theme=None
+    ):
         self.items = items or []  # list of all items
         self.cursor = 0  # selected item in visible items
         self.offset = 0  # offset of first rendered item
@@ -2333,7 +2344,9 @@ class ListWidget:
                 text = self.item_to_text(self.items[self.offset + index])
                 for chunk_index, chunk in enumerate(text.chunk(width - 4)):
                     if self.cursor == index and chunk_index == 0:
-                        left_margin = Text(f" {theme.symbol_selected} ").mark(theme.list_dot)
+                        left_margin = Text(f" {theme.symbol_selected} ").mark(
+                            theme.list_dot
+                        )
                     else:
                         left_margin = Text(" " * (len(theme.symbol_selected) + 2))
                     layout.append([face, left_margin, chunk])
@@ -2370,7 +2383,7 @@ class ListWidget:
         self.layout = layout
         self.layout_height = index
 
-    def render(self):
+    def render(self) -> None:
         tty = self.tty
         width = self.tty.size.width
         for face, left, text, right in self.layout:
@@ -2491,8 +2504,7 @@ class Candidate(tuple):
         return Candidate(fields, positions)
 
     def __str__(self):
-        """Used in ranker to produce candidate string
-        """
+        """Used in ranker to produce candidate string"""
         fields, _ = self
         return "".join(field for field, active in fields if active)
 
@@ -2528,10 +2540,10 @@ class Loader:
                 self.items.append(item)
             return True
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.items)
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return bool(self.items)
 
     def __iter__(self):
@@ -2592,7 +2604,7 @@ class SingletonTask:
         self.closed = False
 
     def __call__(self, task):
-        """"Schedule new task and cancel current one if any
+        """ "Schedule new task and cancel current one if any
 
         Returns boolean flag indicating if previous task has completed
         before this one was scheduled.
@@ -2660,7 +2672,7 @@ async def select(
     keep_order=None,
     height=None,
     prompt=None,
-    tty=None,
+    tty: Optional[TTY] = None,
     executor=None,
     loop=None,
     theme=None,
@@ -2695,13 +2707,13 @@ async def select(
 
     async def rank_coro():
         """Ranking / table update coroutine"""
-        niddle = input.input
+        needle = input.input
         # rank
         start = time.time()
-        if niddle:
+        if needle:
             result = await rank(
                 scorer.scorer,
-                niddle,
+                needle,
                 candidates,
                 loop=loop,
                 executor=executor,
@@ -2822,7 +2834,7 @@ def main_options():
     import textwrap
 
     def parse_nth(argument):
-        def predicate(low, high):
+        def predicate(low: Optional[int], high: Optional[int]) -> Callable[[int], bool]:
             if low is not None and high is not None:
                 return lambda index: low <= index <= high
             elif low is not None:
@@ -2832,11 +2844,11 @@ def main_options():
             else:
                 return lambda _: True
 
-        def predicate_field(index):
+        def predicate_field(index: int) -> bool:
             return index in fields
 
-        fields = set()
-        predicates = [predicate_field]
+        fields: Set[int] = set()
+        predicates: List[Callable[[int], bool]] = [predicate_field]
         for field in argument.split(","):
             field = field.split("..")
             if len(field) == 1:
@@ -2849,9 +2861,7 @@ def main_options():
                     )
                 )
             else:
-                raise argparse.ArgumentTypeError(
-                    f'invalid predicate: {"..".join(fields)}'
-                )
+                raise argparse.ArgumentTypeError(f"invalid predicate: {field}")
 
         return lambda index: any(predicate(index) for predicate in predicates)
 
@@ -2963,7 +2973,7 @@ def main_options():
 def main() -> None:
     options = main_options()
 
-    # `kqueue` does not support tty, fallback to `select`
+    # `k-queue` does not support tty, fallback to `select`
     if sys.platform in ("darwin",):
         import selectors
 

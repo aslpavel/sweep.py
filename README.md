@@ -1,6 +1,7 @@
 ### Sweep.py
 `sweep.py` is yet another command line fuzzy finder (fzf analog)
 
+**NOTE**: that this project in maintanence mode, I've switched to rust based implementation [sweep-rs](https://github.com/aslpavel/sweep-rs) which looks and works very simplarly to this one so check it out. 
 ### Features
   - single source file
   - no dependencies apart from python

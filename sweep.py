@@ -22,7 +22,7 @@ import traceback
 import tty
 import warnings
 
-from collections import namedtuple, deque
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
@@ -33,7 +33,6 @@ from typing import (
     Generator,
     Generic,
     Iterable,
-    Iterator,
     NamedTuple,
     Optional,
     Callable,
@@ -92,7 +91,7 @@ class Pattern:
     STATE_START = 0
     STATE_FAIL = -1
 
-    def __init__(self, table, finals, epsilons=None):
+    def __init__(self, table, finals, epsilons: Optional[Dict[int, Set[int]]] = None):
         assert all(
             -1 <= s < len(table) for ss in table for s in ss.values()
         ), f"invalid transition state found: {table}"
@@ -102,7 +101,7 @@ class Pattern:
 
         self.table: List[Dict[int, int]] = table
         self.finals = finals
-        self.epsilons = epsilons or {}
+        self.epsilons: Dict[int, Set[int]] = epsilons or {}
 
     def check(self, string: str | bytes):
         if not string:
@@ -666,9 +665,9 @@ class EventFramed(EventBase[T]):
         self.fd: int = file if isinstance(file, int) else file.fileno()
         self.decoder = decoder
         self.buffered = EventBuffered()
-        self.running = False
+        self.running: bool = False
 
-    def on(self, handler):
+    def on(self, handler: Handler[T]) -> Handler[T]:
         self.buffered.on(handler)
         return handler
 
@@ -968,9 +967,9 @@ KEY_MOUSE_WHEEL_UP = 4
 KEY_MOUSE_WHEEL_DOWN = 5
 
 
-class TTYEvent(tuple):
-    def __new__(cls, type, attrs):
-        return tuple.__new__(cls, (type, attrs))
+class TTYEvent(NamedTuple):
+    type: int
+    attrs: Sequence[Any]
 
     def __repr__(self):
         type, attrs = self
@@ -1218,7 +1217,9 @@ class TTYDecoder:
         return keys
 
 
-TTYSize = namedtuple("TTYSize", ("height", "width"))
+class TTYSize(NamedTuple):
+    height: int
+    width: int
 
 
 class TTY:
@@ -1595,7 +1596,7 @@ else:
     COLOR_DEPTH_DEFAULT = COLOR_DEPTH_8
 
 
-class Color(tuple):
+class Color(Tuple[float, float, float, float]):
     __slots__: List[str] = []
     HEX_PATTERN = re.compile(
         "^#?"
@@ -1606,7 +1607,8 @@ class Color(tuple):
         "$"
     )
 
-    def __new__(cls, color):
+    def __new__(cls, color: str | Sequence[float]):
+        result: Tuple[float, float, float, float]
         if isinstance(color, str):
             match = cls.HEX_PATTERN.match(color)
             if match is None:
@@ -1616,28 +1618,40 @@ class Color(tuple):
             g = int(g, 16) / 255.0
             b = int(b, 16) / 255.0
             a = 1.0 if a is None else int(a, 16) / 255.0
-            color = (r, g, b, a)
+            result = (r, g, b, a)
         elif isinstance(color, tuple):
             size = len(color)
             if size == 3:
-                color = (*color, 1.0)
+                result = (*color, 1.0)
             elif size == 4:
-                color = color
+                result = color
             else:
                 raise ValueError(f"invalid color: {color}")
         else:
             raise ValueError(f"invalid color: {color}")
-        return tuple.__new__(cls, color)
+        return tuple.__new__(cls, result)
 
-    red = property(lambda self: self[0])
-    gren = property(lambda self: self[1])
-    green = property(lambda self: self[2])
-    alpha = property(lambda self: self[3])
-    luma = property(
-        lambda self: sum(c * p for c, p in zip(self, (0.2126, 0.7152, 0.0722)))
-    )
+    @property
+    def red(self) -> float:
+        return self[0]
 
-    def linear(self):
+    @property
+    def green(self) -> float:
+        return self[1]
+
+    @property
+    def blue(self) -> float:
+        return self[2]
+
+    @property
+    def alpha(self) -> float:
+        return self[3]
+
+    @property
+    def luma(self) -> float:
+        return sum(c * p for c, p in zip(self, (0.2126, 0.7152, 0.0722)))
+
+    def linear(self) -> Color:
         r, g, b, a = self
         return Color(
             (
@@ -1648,7 +1662,7 @@ class Color(tuple):
             )
         )
 
-    def srgb(self):
+    def srgb(self) -> Color:
         r, g, b, a = self
         return Color(
             (
@@ -1659,7 +1673,7 @@ class Color(tuple):
             )
         )
 
-    def hex(self):
+    def hex(self) -> str:
         r, g, b, a = self
         return "#{:02x}{:02x}{:02x}{}".format(
             round(r * 255),
@@ -1668,7 +1682,7 @@ class Color(tuple):
             f"{int(a * 255):02x}" if a != 1 else "",
         )
 
-    def overlay(self, other, linear=True):
+    def overlay(self, other: Optional[Color], linear=True) -> Color:
         """Overlay other color over current color"""
         if other is None:
             return self
@@ -1681,14 +1695,14 @@ class Color(tuple):
         result = Color((r01, g01, b01, a01))
         return result.srgb() if linear else result
 
-    def with_alpha(self, alpha):
+    def with_alpha(self, alpha: float) -> Color:
         return Color((*self[:3], alpha))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         fg = ";38;5;231" if self.luma < 0.5 else ";38;5;232"
         return f"Color(\x1b[00{fg}{self.sgr(False)}m{self.hex()}\x1b[m)"
 
-    def sgr(self, is_fg, depth=None):
+    def sgr(self, is_fg: bool, depth: Optional[int] = None) -> str:
         """Return part of SGR sequence responsible for picking this color"""
         depth = depth or COLOR_DEPTH_DEFAULT
         r, g, b, _ = self
@@ -1734,7 +1748,9 @@ class Color(tuple):
             def l2(lr, lg, lb, rr, rg, rb):
                 return (lr - rr) ** 2 + (lg - rg) ** 2 + (lb - rb) ** 2
 
-            best_fg, best_bg, min_d = None, None, 4
+            best_fg: str = ";97"
+            best_bg: str = ";40"
+            min_d: float = 4
             for fg, bg, cr, cg, cb in (
                 (";30", ";40", 0, 0, 0),
                 (";31", ";41", 0.5, 0, 0),
@@ -1757,6 +1773,7 @@ class Color(tuple):
                 if d < min_d:
                     best_fg, best_bg, min_d = fg, bg, d
             return best_fg if is_fg else best_bg
+        raise ValueError("Invalid depth")
 
 
 FACE_NONE = 0
@@ -1777,17 +1794,12 @@ FACE_RENDER_CACHE = {}
 FACE_OVERLAY_CACHE = {}
 
 
-class Face(tuple):
-    __slots__ = tuple()
+class Face(NamedTuple):
+    fg: Optional[Color] = None
+    bg: Optional[Color] = None
+    attrs: int = FACE_NONE
 
-    def __new__(cls, fg=None, bg=None, attrs=FACE_NONE):
-        return tuple.__new__(cls, (fg, bg, attrs))
-
-    fg = property(lambda self: self[0])
-    bg = property(lambda self: self[1])
-    attrs = property(lambda self: self[2])
-
-    def overlay(self, other, linear=True):
+    def overlay(self, other: Face, linear=True) -> Face:
         face = FACE_OVERLAY_CACHE.get((self, other))
         if face is None:
             fg0, bg0, attrs0 = self
@@ -1800,17 +1812,18 @@ class Face(tuple):
             FACE_OVERLAY_CACHE[(self, other)] = face
         return face
 
-    def invert(self):
+    def invert(self) -> Face:
         fg, bg, attrs = self
         return Face(bg, fg, attrs)
 
-    def with_fg_contrast(self, fg0, fg1):
+    def with_fg_contrast(self, fg0: Color, fg1: Color) -> Face:
         _, bg, attrs = self
+        bg = bg or Color((0, 0, 0, 1))
         fg_light, fg_dark = (fg0, fg1) if fg0.luma > fg1.luma else (fg1, fg0)
         fg = bg.overlay(fg_light if bg.luma < 0.5 else fg_dark)
         return Face(fg, bg, attrs)
 
-    def render(self, stream):
+    def render(self, stream) -> None:
         seq = FACE_RENDER_CACHE.get(self)
         if seq is None:
             fg, bg, attrs = self
@@ -1829,15 +1842,15 @@ class Face(tuple):
             FACE_RENDER_CACHE[self] = seq
         stream.write(seq)
 
-    def __str__(self):
+    def __str__(self) -> str:
         stream = io.StringIO()
         self.render(stream)
         return stream.getvalue()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Face({str(self)} X \x1b[m)"
 
-    def with_sgr(self, params):
+    def with_sgr(self, params: Sequence[int]) -> Face:
         if not params:
             return self
         ansi_colors = (
@@ -1897,6 +1910,8 @@ class Face(tuple):
                     elif n <= 255:
                         v = (8 + 10 * (n - 232)) / 255.0
                         color = Color((v, v, v))
+                    else:
+                        continue
                 elif depth == 2:  # true color
                     if len(params) < 3:
                         break
@@ -1907,6 +1922,8 @@ class Face(tuple):
                             params.pop() / 255.0,
                         )
                     )
+                else:
+                    continue
                 if param == 38:
                     fg = color
                 else:
@@ -1932,24 +1949,26 @@ class Text:
 
     __slots__ = ("_chunks", "_len")
 
-    def __init__(self, chunks):
+    def __init__(self, chunks: List[Tuple[str, Face]] | str):
         if isinstance(chunks, str):
             chunks = [(chunks, Face())]
-        self._chunks = chunks
-        self._len = None
+        self._chunks: List[Tuple[str, Face]] = chunks
+        self._len: Optional[int] = None
 
-    def __len__(self):
+    def __len__(self) -> int:
         if self._len is None:
             self._len = sum(len(c) for c, _ in self._chunks)
         return self._len
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return bool(self._chunks)
 
-    def __add__(self, other):
+    def __add__(self, other: Text) -> Text:
         return Text(self._chunks + other._chunks)
 
-    def mark(self, face, start=None, stop=None):
+    def mark(
+        self, face: Face, start: Optional[int] = None, stop: Optional[int] = None
+    ) -> Text:
         start = 0 if start is None else (start if start >= 0 else len(self) + start)
         stop = len(self) if stop is None else (stop if stop >= 0 else len(self) + stop)
         left, mid = self.split(start)
@@ -1961,7 +1980,7 @@ class Text:
         chunks.extend(right._chunks)
         return Text(chunks)
 
-    def mark_mask(self, face, mask):
+    def mark_mask(self, face: Face, mask: Sequence[int]) -> Text:
         if not mask:
             return self
         # collect ranges
@@ -1987,7 +2006,7 @@ class Text:
         chunks.extend(text._chunks)
         return Text(chunks)
 
-    def split(self, index):
+    def split(self, index: int) -> Tuple[Text, Text]:
         index = index if index >= 0 else len(self) + index
         lefts, rights = [], []
         for chunk_index, (text, face) in enumerate(self._chunks):
@@ -2009,7 +2028,7 @@ class Text:
                 break
         return Text(lefts), Text(rights)
 
-    def join(self, texts):
+    def join(self, texts: Sequence[Text]) -> Text:
         texts = list(texts)
         chunks = []
         index_last = len(texts) - 1
@@ -2019,8 +2038,9 @@ class Text:
                 chunks.extend(self._chunks)
         return Text(chunks)
 
-    def chunk(self, size):
-        text, chunks = self, []
+    def chunk(self, size: int) -> List[Text]:
+        text = self
+        chunks: List[Text] = []
         while text:
             chunk, text = text.split(size)
             chunks.append(chunk)
@@ -2043,7 +2063,7 @@ class Text:
         else:
             raise ValueError("text indices must be integers")
 
-    def render(self, stream, face=Face()):
+    def render(self, stream, face: Face = Face()) -> None:
         p_face = face
         for c_text, c_face in self._chunks:
             c_face = face.overlay(c_face)
@@ -2053,22 +2073,22 @@ class Text:
             stream.write(c_text)
         face.render(stream)
 
-    def __str__(self):
+    def __str__(self) -> str:
         stream = io.StringIO()
         self.render(stream)
         return stream.getvalue()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Text('{str(self)}')"
 
     @classmethod
-    def from_ansi(cls, input):
+    def from_ansi(cls, input: bytes | str) -> Text:
         if isinstance(input, str):
             input = input.encode()
         parse = p_ansi_text()
         parse(None)
 
-        chunks = []
+        chunks: List[Tuple[str, Face]] = []
         chunk, face = io.StringIO(), Face()
         while True:
             for index, byte in enumerate(input):
@@ -2109,9 +2129,9 @@ class Theme:
     __slots__ = ("attrs",)
 
     def __init__(self, attrs):
-        self.attrs = attrs
+        self.attrs: Dict[str, Face | str] = attrs
 
-    def __getattr__(self, name: str) -> Face:
+    def __getattr__(self, name: str) -> Face | str:
         attr = self.attrs.get(name)
         if attr is None:
             raise AttributeError(f"Theme does not have '{name}' attribute")
@@ -2427,11 +2447,9 @@ class ListWidget:
 # ------------------------------------------------------------------------------
 # Select
 # ------------------------------------------------------------------------------
-class Candidate(tuple):
-    __slots__ = tuple()
-
-    def __new__(cls, fields, positions=None):
-        return tuple.__new__(cls, (fields, positions))
+class Candidate(NamedTuple):
+    fileds: Sequence[Tuple[str, bool]]
+    positions: Optional[List[int]] = None
 
     @classmethod
     def from_str(cls, string, delimiter=None, predicate=None):
@@ -2529,12 +2547,12 @@ class Candidate(tuple):
                 offset += len(field)
         return Candidate(fields, positions)
 
-    def __str__(self):
+    def __str__(self) -> str:
         """Used in ranker to produce candidate string"""
         fields, _ = self
         return "".join(field for field, active in fields if active)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         stream = io.StringIO()
         self.to_text().render(stream)
         return f"Candidate('{stream.getvalue()}')"
